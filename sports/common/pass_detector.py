@@ -359,16 +359,25 @@ class PassDetector:
         end_pos: np.ndarray,
         event_type: EventType,
     ) -> PassEvent:
-        """Create and store a PassEvent, update team statistics."""
+        """Create and store a PassEvent, update team statistics.
+
+        Uses _active_passer_id/_active_passer_team (locked at pass initiation)
+        as the passer identity to avoid corruption from silent handovers.
+        """
         duration = (frame_end - self._pass_start_frame) / self.fps
         distance = float(np.linalg.norm(end_pos - self._pass_start_pos))
+
+        # Use the locked passer identity from pass initiation, not the
+        # current possessor which may have been changed by silent handovers
+        passer_id = self._active_passer_id
+        passer_team = self._active_passer_team
 
         event = PassEvent(
             pass_id=self._next_pass_id,
             frame_start=self._pass_start_frame,
             frame_end=frame_end,
-            passer_id=self._possessor_id,
-            passer_team=self._possessor_team,
+            passer_id=passer_id,
+            passer_team=passer_team,
             receiver_id=receiver_id,
             receiver_team=receiver_team,
             start_pos_2d=(float(self._pass_start_pos[0]),
@@ -382,19 +391,15 @@ class PassDetector:
         self._events.append(event)
         self._next_pass_id += 1
 
-        # Update team stats (only for actual passes, not carries)
-        # Filter: ignore very short-distance events (< 2m) which are
-        # contested ball situations, not real pass attempts.
-        if event_type != EventType.CARRY and distance >= 2.0:
-            passer_team = self._possessor_team
-            if passer_team in self._team_stats:
-                self._team_stats[passer_team]["total"] += 1
-                if event_type == EventType.COMPLETED:
-                    self._team_stats[passer_team]["completed"] += 1
-                elif event_type == EventType.INTERCEPTED:
-                    self._team_stats[passer_team]["intercepted"] += 1
-                elif event_type == EventType.INCOMPLETE:
-                    self._team_stats[passer_team]["incomplete"] += 1
+        # Update team stats — ONLY count COMPLETED passes.
+        # A completed pass = same-team passer → same-team receiver through flight.
+        # Interceptions and incompletes are NOT counted as passes for either team.
+        # Filter: ignore very short-distance events (< 2m) — contested ball noise.
+        if (event_type == EventType.COMPLETED
+                and distance >= 2.0
+                and passer_team in self._team_stats):
+            self._team_stats[passer_team]["total"] += 1
+            self._team_stats[passer_team]["completed"] += 1
 
         # Set cooldown after logging an event to prevent spam
         self._event_cooldown = self._EVENT_COOLDOWN_FRAMES
@@ -509,15 +514,23 @@ class PassDetector:
                 self._active_passer_team = self._possessor_team
 
             elif nearest_dist <= self.control_radius and nearest_id != self._possessor_id:
-                # Different player grabbed the ball directly (no flight phase)
-                # FIX #2: Silent handover — do NOT log event here.
-                # Only real passes (ball goes through PASS_IN_FLIGHT) create events.
-                # This prevents spam from detection jitter when players contest.
-                self._possessor_id = nearest_id
-                self._possessor_team = nearest_team
-                self._possession_count = 1
-                self._drift_count = 0
-                self._active_pass_start_pitch = None
+                # Different player near the ball — require stability before handover
+                # to prevent detection jitter from corrupting passer team identity
+                if nearest_id == self._candidate_id:
+                    self._candidate_count += 1
+                else:
+                    self._candidate_id = nearest_id
+                    self._candidate_count = 1
+
+                if self._candidate_count >= self.min_possession_frames:
+                    # Stable new possessor confirmed → silent handover
+                    self._possessor_id = nearest_id
+                    self._possessor_team = nearest_team
+                    self._possession_count = self._candidate_count
+                    self._candidate_id = -1
+                    self._candidate_count = 0
+                    self._drift_count = 0
+                    self._active_pass_start_pitch = None
 
             else:
                 # Ball drifted slightly but not fast enough
@@ -547,8 +560,9 @@ class PassDetector:
 
                 if self._candidate_count >= self.min_touch_frames:
                     # Valid reception confirmed
-                    if nearest_id == self._possessor_id:
-                        # DRIBBLE FILTER: ball returned to original possessor
+                    if nearest_id == self._active_passer_id:
+                        # DRIBBLE FILTER: ball returned to original passer
+                        # This is a ball control / dribble, NOT a pass
                         result = self._log_event(
                             frame_end=frame_id,
                             receiver_id=nearest_id,
@@ -556,8 +570,8 @@ class PassDetector:
                             end_pos=ball_pos,
                             event_type=EventType.CARRY,
                         )
-                    elif nearest_team == self._possessor_team:
-                        # Completed pass to teammate
+                    elif nearest_team == self._active_passer_team:
+                        # Completed pass: same-team passer → same-team receiver
                         result = self._log_event(
                             frame_end=frame_id,
                             receiver_id=nearest_id,
@@ -566,7 +580,7 @@ class PassDetector:
                             event_type=EventType.COMPLETED,
                         )
                     else:
-                        # Intercepted by opponent
+                        # Intercepted by opponent — not counted as a pass
                         result = self._log_event(
                             frame_end=frame_id,
                             receiver_id=nearest_id,
