@@ -248,9 +248,9 @@ class PassDetector:
 
     def __init__(
         self,
-        control_radius_m: float = 1.5,
+        control_radius_m: float = 2.0,
         min_possession_frames: int = 3,
-        min_pass_speed_ms: float = 3.5,
+        min_pass_speed_ms: float = 5.0,
         max_flight_frames: int = 90,
         min_touch_frames: int = 2,
         fps: float = 30.0,
@@ -262,6 +262,14 @@ class PassDetector:
         self.max_flight_frames = max_flight_frames
         self.min_touch_frames = min_touch_frames
         self.fps = fps
+
+        # Anti-spam cooldown (Fix #1)
+        self._event_cooldown: int = 0
+        self._EVENT_COOLDOWN_FRAMES: int = 8  # ~0.27s at 30fps
+
+        # Drift counter for gradual ball loss (Fix #3)
+        self._drift_count: int = 0
+        self._MAX_DRIFT_FRAMES: int = 10  # ~0.33s at 30fps
 
         # FSM state
         self._state: PassState = PassState.IDLE
@@ -375,9 +383,9 @@ class PassDetector:
         self._next_pass_id += 1
 
         # Update team stats (only for actual passes, not carries)
-        # Filter: ignore very short-distance events (< 3m) which are
+        # Filter: ignore very short-distance events (< 2m) which are
         # contested ball situations, not real pass attempts.
-        if event_type != EventType.CARRY and distance >= 3.0:
+        if event_type != EventType.CARRY and distance >= 2.0:
             passer_team = self._possessor_team
             if passer_team in self._team_stats:
                 self._team_stats[passer_team]["total"] += 1
@@ -387,6 +395,9 @@ class PassDetector:
                     self._team_stats[passer_team]["intercepted"] += 1
                 elif event_type == EventType.INCOMPLETE:
                     self._team_stats[passer_team]["incomplete"] += 1
+
+        # Set cooldown after logging an event to prevent spam
+        self._event_cooldown = self._EVENT_COOLDOWN_FRAMES
 
         return event
 
@@ -445,6 +456,10 @@ class PassDetector:
 
         result: Optional[PassEvent] = None
 
+        # Decrement cooldown timer
+        if self._event_cooldown > 0:
+            self._event_cooldown -= 1
+
         # ============================================================
         # FSM State Transitions
         # ============================================================
@@ -465,6 +480,7 @@ class PassDetector:
                     self._possession_count = self._candidate_count
                     self._candidate_id = -1
                     self._candidate_count = 0
+                    self._drift_count = 0
             else:
                 self._candidate_id = -1
                 self._candidate_count = 0
@@ -472,8 +488,9 @@ class PassDetector:
         elif self._state == PassState.IN_POSSESSION:
             # ---- IN_POSSESSION: a player has the ball ----
             if nearest_dist <= self.control_radius and nearest_id == self._possessor_id:
-                # Still in possession
+                # Still in possession — reset drift counter
                 self._possession_count += 1
+                self._drift_count = 0
 
             elif (ball_speed >= self.min_pass_speed
                   and nearest_dist > self.control_radius):
@@ -484,6 +501,7 @@ class PassDetector:
                 self._flight_frame_count = 1
                 self._candidate_id = -1
                 self._candidate_count = 0
+                self._drift_count = 0
 
                 # Store for annotator
                 self._active_pass_start_pitch = self._pass_start_pos.copy()
@@ -492,40 +510,28 @@ class PassDetector:
 
             elif nearest_dist <= self.control_radius and nearest_id != self._possessor_id:
                 # Different player grabbed the ball directly (no flight phase)
-                # This is a very close-range pass or tackle
-                if nearest_team == self._possessor_team:
-                    # Short pass to teammate
-                    self._pass_start_frame = frame_id - 1
-                    self._pass_start_pos = ball_pos.copy()
-                    result = self._log_event(
-                        frame_end=frame_id,
-                        receiver_id=nearest_id,
-                        receiver_team=nearest_team,
-                        end_pos=ball_pos,
-                        event_type=EventType.COMPLETED,
-                    )
-                else:
-                    # Dispossessed by opponent
-                    self._pass_start_frame = frame_id - 1
-                    self._pass_start_pos = ball_pos.copy()
-                    result = self._log_event(
-                        frame_end=frame_id,
-                        receiver_id=nearest_id,
-                        receiver_team=nearest_team,
-                        end_pos=ball_pos,
-                        event_type=EventType.INTERCEPTED,
-                    )
-
-                # Transfer possession
+                # FIX #2: Silent handover — do NOT log event here.
+                # Only real passes (ball goes through PASS_IN_FLIGHT) create events.
+                # This prevents spam from detection jitter when players contest.
                 self._possessor_id = nearest_id
                 self._possessor_team = nearest_team
                 self._possession_count = 1
+                self._drift_count = 0
                 self._active_pass_start_pitch = None
 
             else:
-                # Ball drifted slightly but not fast enough → stay in possession
-                # (handles small bobbles / detection jitter)
-                self._possession_count += 1
+                # Ball drifted slightly but not fast enough
+                # FIX #3: Track drift duration — if ball stays away too long,
+                # transition to IDLE instead of holding IN_POSSESSION forever
+                self._drift_count += 1
+                if self._drift_count >= self._MAX_DRIFT_FRAMES:
+                    # Ball has been away too long → lost possession
+                    self._state = PassState.IDLE
+                    self._possessor_id = -1
+                    self._possessor_team = -1
+                    self._possession_count = 0
+                    self._drift_count = 0
+                    self._active_pass_start_pitch = None
 
         elif self._state == PassState.PASS_IN_FLIGHT:
             # ---- PASS_IN_FLIGHT: ball is traveling between players ----
