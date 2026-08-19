@@ -908,24 +908,22 @@ class PassAnnotator:
         x, y = self.hud_position
         stats_0 = pass_detector.get_team_stats().get(0, {})
         stats_1 = pass_detector.get_team_stats().get(1, {})
-        acc_0 = pass_detector.get_pass_accuracy(0)
-        acc_1 = pass_detector.get_pass_accuracy(1)
 
         completed_0 = stats_0.get("completed", 0)
-        total_0 = stats_0.get("total", 0)
         completed_1 = stats_1.get("completed", 0)
-        total_1 = stats_1.get("total", 0)
 
-        line_1 = f"{name_0}: {completed_0}/{total_0} passes ({acc_0:.0f}%)"
-        line_2 = f"{name_1}: {completed_1}/{total_1} passes ({acc_1:.0f}%)"
+        title = "Completed Passes"
+        line_1 = f"{name_0}: {completed_0}"
+        line_2 = f"{name_1}: {completed_1}"
 
         overlay_stat = frame.copy()
-        cv2.rectangle(overlay_stat, (x, y), (x + 270, y + 54), (15, 15, 15), -1)
+        cv2.rectangle(overlay_stat, (x, y), (x + 200, y + 70), (15, 15, 15), -1)
         cv2.addWeighted(overlay_stat, 0.65, frame, 0.35, 0, frame)
-        cv2.rectangle(frame, (x, y), (x + 270, y + 54), (80, 80, 80), 1)
+        cv2.rectangle(frame, (x, y), (x + 200, y + 70), (80, 80, 80), 1)
 
-        cv2.putText(frame, line_1, (x + 10, y + 20), font, 0.45, color_0, 1)
-        cv2.putText(frame, line_2, (x + 10, y + 42), font, 0.45, color_1, 1)
+        cv2.putText(frame, title, (x + 10, y + 16), font, 0.45, (255, 255, 255), 1)
+        cv2.putText(frame, line_1, (x + 10, y + 38), font, 0.45, color_0, 1)
+        cv2.putText(frame, line_2, (x + 10, y + 58), font, 0.45, color_1, 1)
 
         return frame
 
