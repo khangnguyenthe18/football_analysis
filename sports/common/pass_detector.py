@@ -391,15 +391,22 @@ class PassDetector:
         self._events.append(event)
         self._next_pass_id += 1
 
-        # Update team stats — ONLY count COMPLETED passes.
-        # A completed pass = same-team passer → same-team receiver through flight.
-        # Interceptions and incompletes are NOT counted as passes for either team.
+        # Update team stats for the PASSER's team only.
+        # - COMPLETED → total +1, completed +1
+        # - INTERCEPTED → total +1 (failed pass attempt by passer's team)
+        # - INCOMPLETE → total +1 (failed pass attempt by passer's team)
+        # - CARRY → ignored (dribble, not a pass)
         # Filter: ignore very short-distance events (< 2m) — contested ball noise.
-        if (event_type == EventType.COMPLETED
+        if (event_type != EventType.CARRY
                 and distance >= 2.0
                 and passer_team in self._team_stats):
             self._team_stats[passer_team]["total"] += 1
-            self._team_stats[passer_team]["completed"] += 1
+            if event_type == EventType.COMPLETED:
+                self._team_stats[passer_team]["completed"] += 1
+            elif event_type == EventType.INTERCEPTED:
+                self._team_stats[passer_team]["intercepted"] += 1
+            elif event_type == EventType.INCOMPLETE:
+                self._team_stats[passer_team]["incomplete"] += 1
 
         # Set cooldown after logging an event to prevent spam
         self._event_cooldown = self._EVENT_COOLDOWN_FRAMES
