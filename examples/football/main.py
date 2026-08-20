@@ -22,6 +22,7 @@ from sports.annotators.football import (
     draw_passing_network,
     draw_player_speed_badges,
     draw_physical_dashboard,
+    draw_match_analysis_screen,
 )
 from sports.common.ball import BallTracker, BallAnnotator
 from sports.common.pass_detector import PassDetector, PassAnnotator
@@ -687,10 +688,54 @@ def run_pass_detection(
     phys_dash_path = os.path.join(reports_dir, "physical_dashboard.png")
     cv2.imwrite(phys_dash_path, img_physical_dash)
 
+    # 4. Generate All-in-One Match Analysis Screen
+    t0_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 0)
+    t1_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 1)
+    t0_total_dist = sum(s.total_distance_m for s in team_0_phys)
+    t1_total_dist = sum(s.total_distance_m for s in team_1_phys)
+    t0_peak_spd = max([s.max_speed_kmh for s in team_0_phys] + [0.0])
+    t1_peak_spd = max([s.max_speed_kmh for s in team_1_phys] + [0.0])
+
+    t0_stats = {
+        'completed_passes': t0_completed_passes,
+        'pass_accuracy': pass_detector.get_pass_accuracy(0),
+        'possession_pct': pass_detector.get_possession_pct(0),
+        'total_distance_m': t0_total_dist,
+        'peak_speed_kmh': t0_peak_spd,
+    }
+    t1_stats = {
+        'completed_passes': t1_completed_passes,
+        'pass_accuracy': pass_detector.get_pass_accuracy(1),
+        'possession_pct': pass_detector.get_possession_pct(1),
+        'total_distance_m': t1_total_dist,
+        'peak_speed_kmh': t1_peak_spd,
+    }
+
+    vid_w = video_info.width if video_info.width else 1280
+    vid_h = video_info.height if video_info.height else 720
+
+    match_analysis_img = draw_match_analysis_screen(
+        img_hm_0=img_hm_0,
+        img_hm_1=img_hm_1,
+        img_net_0=img_net_0,
+        img_net_1=img_net_1,
+        team_0_stats=t0_stats,
+        team_1_stats=t1_stats,
+        team_0_color=sv.Color.from_hex(COLORS[0]),
+        team_1_color=sv.Color.from_hex(COLORS[1]),
+        team_0_name="Team 1",
+        team_1_name="Team 2",
+        width=vid_w,
+        height=vid_h,
+    )
+    match_analysis_path = os.path.join(reports_dir, "match_analysis_summary.png")
+    cv2.imwrite(match_analysis_path, match_analysis_img)
+
     print("\n" + "=" * 70)
     print("ANALYTICS & PHYSICAL PERFORMANCE REPORTS GENERATED")
     print("=" * 70)
     print(f"Reports saved to folder: '{os.path.abspath(reports_dir)}'")
+    print(f"  [+] Match Analysis Summary:  {match_analysis_path}")
     print(f"  [+] Heatmap Team 1:          {hm0_path}")
     print(f"  [+] Heatmap Team 2:          {hm1_path}")
     print(f"  [+] Passing Network Team 1:  {net0_path}")
@@ -704,6 +749,11 @@ def run_pass_detection(
         top_duos_1 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_1.top_combinations[:3]])
         print(f"  [>] Team 2 Top Combinations: {top_duos_1}")
     print("=" * 70 + "\n")
+
+    # 5. Append Match Analysis Screen to Video for 6 seconds (e.g. ~180 frames)
+    summary_frames_count = int(fps * 6.0)
+    for _ in range(summary_frames_count):
+        yield match_analysis_img
 
 
 def main(

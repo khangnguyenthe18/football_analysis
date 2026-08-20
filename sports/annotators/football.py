@@ -930,3 +930,132 @@ def draw_offside_pitch_snapshot(
     return pitch
 
 
+def draw_match_analysis_screen(
+    img_hm_0: np.ndarray,
+    img_hm_1: np.ndarray,
+    img_net_0: np.ndarray,
+    img_net_1: np.ndarray,
+    team_0_stats: Dict[str, Any],
+    team_1_stats: Dict[str, Any],
+    team_0_color: sv.Color = sv.Color.from_hex('#FF1493'),
+    team_1_color: sv.Color = sv.Color.from_hex('#00BFFF'),
+    team_0_name: str = "Team 1",
+    team_1_name: str = "Team 2",
+    width: int = 1280,
+    height: int = 720,
+) -> np.ndarray:
+    """
+    Renders an all-in-one broadcast-quality Match Analysis summary screen containing:
+    1. Header Bar: Match Analysis Title
+    2. Team Comparative Performance Cards (Completed Passes, Accuracy, Possession, Peak Speed, Total Distance)
+    3. 2x2 Tactical Grid:
+       - Top-Left: Team 1 Positional Heatmap
+       - Top-Right: Team 2 Positional Heatmap
+       - Bottom-Left: Team 1 Passing Network
+       - Bottom-Right: Team 2 Passing Network
+
+    Args:
+        img_hm_0: Team 1 Heatmap image.
+        img_hm_1: Team 2 Heatmap image.
+        img_net_0: Team 1 Passing Network image.
+        img_net_1: Team 2 Passing Network image.
+        team_0_stats: Dict with keys ['completed_passes', 'pass_accuracy', 'possession_pct', 'total_distance_m', 'peak_speed_kmh'].
+        team_1_stats: Dict with keys ['completed_passes', 'pass_accuracy', 'possession_pct', 'total_distance_m', 'peak_speed_kmh'].
+        team_0_color: Color for Team 1.
+        team_1_color: Color for Team 2.
+        team_0_name: Name for Team 1.
+        team_1_name: Name for Team 2.
+        width: Canvas width in pixels.
+        height: Canvas height in pixels.
+
+    Returns:
+        np.ndarray: Match analysis canvas image.
+    """
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:] = (18, 22, 28)  # Deep slate dark background
+
+    c0 = team_0_color.as_bgr()
+    c1 = team_1_color.as_bgr()
+
+    # 1. Header Bar
+    header_h = max(42, int(height * 0.065))
+    cv2.rectangle(canvas, (0, 0), (width, header_h), (12, 14, 18), -1)
+    cv2.line(canvas, (0, header_h), (width, header_h), (50, 55, 65), 1)
+
+    cv2.putText(canvas, "MATCH ANALYSIS - FULL TIME SUMMARY", (24, int(header_h * 0.68)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "AI COMPUTER VISION ANALYTICS", (width - 280, int(header_h * 0.68)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 175, 190), 1, cv2.LINE_AA)
+
+    # 2. Team Comparative Performance Cards (Top Section)
+    stats_y = header_h + 10
+    stats_h = max(110, int(height * 0.19))
+    col_w = (width - 50) // 2
+
+    def draw_team_summary_card(x: int, name: str, color: Tuple[int, int, int], stats: Dict[str, Any]):
+        cv2.rectangle(canvas, (x, stats_y), (x + col_w, stats_y + stats_h), (26, 30, 38), -1)
+        cv2.rectangle(canvas, (x, stats_y), (x + col_w, stats_y + stats_h), (60, 65, 75), 1)
+        # Accent top bar
+        cv2.rectangle(canvas, (x, stats_y), (x + col_w, stats_y + 3), color, -1)
+
+        # Team Title
+        cv2.putText(canvas, name.upper(), (x + 16, stats_y + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA)
+
+        completed_p = stats.get('completed_passes', 0)
+        acc_p = stats.get('pass_accuracy', 0.0)
+        poss_p = stats.get('possession_pct', 0.0)
+        tot_dist = stats.get('total_distance_m', 0.0)
+        peak_spd = stats.get('peak_speed_kmh', 0.0)
+
+        # Left column metrics
+        m1 = f"Completed Passes: {completed_p} ({acc_p:.1f}%)"
+        m2 = f"Possession Rate: {poss_p:.1f}%"
+        cv2.putText(canvas, m1, (x + 16, stats_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 235, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, m2, (x + 16, stats_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 235, 240), 1, cv2.LINE_AA)
+
+        # Right column metrics
+        m3 = f"Total Distance: {tot_dist:.1f} m ({tot_dist/1000.0:.2f} km)"
+        m4 = f"Peak Sprint Speed: {peak_spd:.1f} km/h"
+        rx = x + col_w // 2 + 10
+        cv2.putText(canvas, m3, (rx, stats_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 235, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, m4, (rx, stats_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 215, 255), 1, cv2.LINE_AA)
+
+    draw_team_summary_card(18, team_0_name, c0, team_0_stats)
+    draw_team_summary_card(32 + col_w, team_1_name, c1, team_1_stats)
+
+    # 3. 2x2 Tactical Grid of 4 Pitches
+    grid_y = stats_y + stats_h + 10
+    grid_h = height - grid_y - 12
+    grid_w = width - 36
+    cell_w = (grid_w - 14) // 2
+    cell_h = (grid_h - 10) // 2
+
+    def place_subpanel(img: np.ndarray, row: int, col: int, label: str, tag_color: Tuple[int, int, int]):
+        px = 18 + col * (cell_w + 14)
+        py = grid_y + row * (cell_h + 10)
+
+        # Resize image to cell
+        if img is not None and img.size > 0:
+            resized = cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+            canvas[py:py + cell_h, px:px + cell_w] = resized
+
+        # Cell border
+        cv2.rectangle(canvas, (px, py), (px + cell_w, py + cell_h), (55, 60, 72), 1)
+
+        # Title Pill Tag
+        tw = min(220, cell_w - 10)
+        cv2.rectangle(canvas, (px + 6, py + 6), (px + 6 + tw, py + 26), (15, 18, 24), -1)
+        cv2.rectangle(canvas, (px + 6, py + 6), (px + 6 + tw, py + 26), tag_color, 1)
+        cv2.putText(canvas, label, (px + 12, py + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Place 4 panels
+    place_subpanel(img_hm_0, 0, 0, f"{team_0_name} - Positional Heatmap", c0)
+    place_subpanel(img_hm_1, 0, 1, f"{team_1_name} - Positional Heatmap", c1)
+    place_subpanel(img_net_0, 1, 0, f"{team_0_name} - Passing Network", c0)
+    place_subpanel(img_net_1, 1, 1, f"{team_1_name} - Passing Network", c1)
+
+    return canvas
+
+
