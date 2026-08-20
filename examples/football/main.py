@@ -886,7 +886,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
     parser.add_argument('--reports_dir', type=str, default='reports')
     parser.add_argument('--no-speed', dest='show_speed', action='store_false', help='Disable live speed badges on players')
-    parser.add_argument('--voronoi', action='store_true', default=False, help='Enable Voronoi tactical minimap overlay')
+    parser.add_argument('--voronoi', action='store_true', default=True, help='Enable Voronoi tactical minimap overlay (enabled by default)')
     parser.set_defaults(show_speed=True)
     args = parser.parse_args()
     main(
