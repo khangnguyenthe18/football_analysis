@@ -28,6 +28,7 @@ from sports.common.ball import BallTracker, BallAnnotator
 from sports.common.pass_detector import PassDetector, PassAnnotator
 from sports.common.physical import PlayerSpeedTracker
 from sports.common.tactical import HeatmapTracker, PassingNetworkAnalyzer
+from sports.common.voronoi import VoronoiMinimap
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
 from sports.configs.football import SoccerPitchConfiguration
@@ -409,6 +410,7 @@ def run_pass_detection(
     device: str,
     reports_dir: str = 'reports',
     show_speed: bool = True,
+    show_voronoi: bool = False,
 ) -> Iterator[np.ndarray]:
     """
     Run pass detection on a video and yield annotated frames.
@@ -458,6 +460,9 @@ def run_pass_detection(
         pitch_width_m=CONFIG.width / 100.0
     )
     speed_tracker = PlayerSpeedTracker(fps=fps)
+
+    # Voronoi tactical minimap
+    voronoi_minimap = VoronoiMinimap(config=CONFIG, minimap_width=360, alpha=0.30) if show_voronoi else None
 
     pass_annotator = PassAnnotator(
         team_colors=(
@@ -597,6 +602,35 @@ def run_pass_detection(
         if current_transformer is not None:
             annotated_frame = pass_annotator.annotate(
                 annotated_frame, pass_detector, current_transformer, frame_id)
+
+        # Voronoi tactical minimap overlay (bottom-right corner)
+        if voronoi_minimap is not None and current_transformer is not None and len(all_field_players) > 0:
+            try:
+                # player_xy_pitch_cm was computed at line ~539 as player_xy_pitch_cm
+                # We need the cm values (before /100 conversion)
+                _p_xy_px = all_field_players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                _p_xy_cm = current_transformer.transform_points(_p_xy_px)
+
+                _ball_cm = None
+                if len(ball_detections) > 0:
+                    _b_px = ball_detections.get_anchors_coordinates(sv.Position.CENTER)
+                    _ball_cm = current_transformer.transform_points(_b_px)[0]
+
+                _minimap_img = voronoi_minimap.render(
+                    player_xy_pitch_cm=_p_xy_cm,
+                    player_team_ids=all_field_team_ids,
+                    player_jersey_ids=all_field_players.tracker_id,
+                    team_colors={
+                        0: sv.Color.from_hex(COLORS[0]).as_bgr(),
+                        1: sv.Color.from_hex(COLORS[1]).as_bgr(),
+                    },
+                    ball_xy_pitch_cm=_ball_cm,
+                )
+                annotated_frame = VoronoiMinimap.composite_on_frame(
+                    annotated_frame, _minimap_img
+                )
+            except Exception:
+                pass  # Silently skip minimap on error
 
         frame_id += 1
         yield annotated_frame
@@ -788,7 +822,8 @@ def main(
     device: str,
     mode: Mode,
     reports_dir: str = 'reports',
-    show_speed: bool = True
+    show_speed: bool = True,
+    show_voronoi: bool = False,
 ) -> None:
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
@@ -813,7 +848,8 @@ def main(
             source_video_path=source_video_path,
             device=device,
             reports_dir=reports_dir,
-            show_speed=show_speed
+            show_speed=show_speed,
+            show_voronoi=show_voronoi,
         )
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
@@ -850,6 +886,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
     parser.add_argument('--reports_dir', type=str, default='reports')
     parser.add_argument('--no-speed', dest='show_speed', action='store_false', help='Disable live speed badges on players')
+    parser.add_argument('--voronoi', action='store_true', default=False, help='Enable Voronoi tactical minimap overlay')
     parser.set_defaults(show_speed=True)
     args = parser.parse_args()
     main(
@@ -858,5 +895,6 @@ if __name__ == '__main__':
         device=args.device,
         mode=args.mode,
         reports_dir=args.reports_dir,
-        show_speed=args.show_speed
+        show_speed=args.show_speed,
+        show_voronoi=args.voronoi,
     )
