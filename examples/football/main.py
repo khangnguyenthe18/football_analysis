@@ -750,8 +750,8 @@ def run_pass_detection(
         print(f"  [>] Team 2 Top Combinations: {top_duos_1}")
     print("=" * 70 + "\n")
 
-    # 5. Append Match Analysis Screen to Video for 6 seconds (e.g. ~180 frames)
-    summary_frames_count = int(fps * 6.0)
+    # 5. Append Match Analysis Screen to Video for 8 seconds (e.g. ~240 frames)
+    summary_frames_count = int(fps * 8.0)
     for _ in range(summary_frames_count):
         yield match_analysis_img
 
