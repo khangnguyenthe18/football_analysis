@@ -591,10 +591,10 @@ def draw_player_speed_badges(
     for i, (tid, anchor) in enumerate(zip(detections.tracker_id, bottom_anchors)):
         team_idx = int(custom_color_lookup[i]) if custom_color_lookup is not None and i < len(custom_color_lookup) else 0
 
-        # 1. Bỏ qua hoàn toàn trọng tài
+        # 1. Bỏ qua hoàn toàn trọng tài (Trọng tài có team_idx không thuộc (0, 1) hoặc class_id == 3)
         if team_idx not in (0, 1):
             continue
-        if detections.class_id is not None and detections.class_id[i] == 2:  # REFEREE_CLASS_ID
+        if detections.class_id is not None and detections.class_id[i] == 3:  # REFEREE_CLASS_ID = 3
             continue
 
         tid = int(tid)
