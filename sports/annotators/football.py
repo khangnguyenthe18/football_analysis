@@ -1009,13 +1009,13 @@ def draw_match_analysis_screen(
         peak_spd = stats.get('peak_speed_kmh', 0.0)
 
         # Left column metrics
-        m1 = f"Completed Passes: {completed_p} ({acc_p:.1f}%)"
+        m1 = f"Completed Passes: {completed_p}"
         m2 = f"Possession Rate: {poss_p:.1f}%"
         cv2.putText(canvas, m1, (x + 16, stats_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 235, 240), 1, cv2.LINE_AA)
         cv2.putText(canvas, m2, (x + 16, stats_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 235, 240), 1, cv2.LINE_AA)
 
         # Right column metrics
-        m3 = f"Total Distance: {tot_dist:.1f} m ({tot_dist/1000.0:.2f} km)"
+        m3 = f"Total Distance: {tot_dist:.1f} m"
         m4 = f"Peak Sprint Speed: {peak_spd:.1f} km/h"
         rx = x + col_w // 2 + 10
         cv2.putText(canvas, m3, (rx, stats_y + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 235, 240), 1, cv2.LINE_AA)
