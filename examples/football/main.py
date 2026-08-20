@@ -620,7 +620,7 @@ def run_pass_detection(
                     custom_color_lookup=color_lookup, color_palette=COLORS
                 )
             elif all_detections.tracker_id is not None:
-                labels = [str(tid) for tid in all_detections.tracker_id]
+                labels = [str(tid) if (i < len(color_lookup) and color_lookup[i] in (0, 1)) else '' for i, tid in enumerate(all_detections.tracker_id)]
                 annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
                     annotated_frame, all_detections, labels,
                     custom_color_lookup=color_lookup)

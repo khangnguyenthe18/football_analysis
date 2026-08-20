@@ -156,18 +156,12 @@ class OffsideDetector:
         def_team = 1 - att_team if att_team in (0, 1) else 1
         att_dir = self._team_directions.get(att_team, AttackDirection.RIGHT)
 
-        # 1. Defending players positions
-        def_mask = (player_team_ids == def_team)
-        if def_mask.sum() < 1:
-            return None
+        start_x = float(pass_event.start_pos_2d[0])
+        end_x = float(pass_event.end_pos_2d[0])
 
-        def_xy = player_xy_pitch[def_mask]
-        def_ids = player_tracker_ids[def_mask]
-
-        # 2. Attacking receiver position
+        # 1. Attacking receiver position
         receiver_id = pass_event.receiver_id
         if receiver_id == -1:
-            # If incomplete, use end position of pass
             att_pos = np.array(pass_event.end_pos_2d, dtype=np.float32)
         else:
             rec_mask = (player_tracker_ids == receiver_id)
@@ -182,16 +176,32 @@ class OffsideDetector:
         if ball_xy_pitch is not None:
             ball_x = float(ball_xy_pitch[0])
         else:
-            ball_x = float(pass_event.start_pos_2d[0])
+            ball_x = start_x
 
-        # 3. Find second-to-last defender and calculate offside line
+        # 2. Filter: Only evaluate offside for forward attacking passes into/near opponent half
         if att_dir == AttackDirection.RIGHT:
-            # Defending goal is at X = 120m (highest X values)
-            sorted_indices = np.argsort(-def_xy[:, 0])  # Descending by X
+            is_forward = (end_x > start_x - 1.0)
+            in_attacking_zone = (attacker_x > 50.0 or end_x > 50.0)
+            if not (is_forward and in_attacking_zone):
+                return None  # Routine pass in defensive zone, do not trigger offside line
+
+            # Defending players on their defensive half (X > 45m)
+            def_mask = (player_team_ids == def_team) & (player_xy_pitch[:, 0] > 45.0)
+            if def_mask.sum() < 1:
+                # Fallback to all defenders
+                def_mask = (player_team_ids == def_team)
+                if def_mask.sum() < 1:
+                    return None
+
+            def_xy = player_xy_pitch[def_mask]
+            def_ids = player_tracker_ids[def_mask]
+
+            # Defending goal at X = 120m (highest X)
+            sorted_indices = np.argsort(-def_xy[:, 0])  # Deepest defenders first
             if len(sorted_indices) >= 2:
-                sec_def_idx = sorted_indices[1]
+                sec_def_idx = sorted_indices[1]  # Second-to-last defender
             else:
-                sec_def_idx = sorted_indices[0]
+                sec_def_idx = sorted_indices[0]  # Last defender
 
             sec_def_id = int(def_ids[sec_def_idx])
             sec_def_x = float(def_xy[sec_def_idx, 0])
@@ -200,15 +210,27 @@ class OffsideDetector:
             offside_line_x = max(sec_def_x, ball_x)
             margin = attacker_x - offside_line_x
 
-            # Offside criteria:
-            # 1. Must be in opponent half (attacker_x > 60m)
-            # 2. Must be ahead of offside line (attacker_x > offside_line_x + 0.05m)
-            # 3. Must be ahead of the ball (attacker_x > ball_x + 0.05m)
+            # Offside rule criteria
             is_offside = bool((attacker_x > self.halfway_x) and (attacker_x > offside_line_x + 0.05) and (attacker_x > ball_x + 0.05))
 
         else:  # AttackDirection.LEFT
-            # Defending goal is at X = 0m (lowest X values)
-            sorted_indices = np.argsort(def_xy[:, 0])  # Ascending by X
+            is_forward = (end_x < start_x + 1.0)
+            in_attacking_zone = (attacker_x < 70.0 or end_x < 70.0)
+            if not (is_forward and in_attacking_zone):
+                return None
+
+            # Defending players on their defensive half (X < 75m)
+            def_mask = (player_team_ids == def_team) & (player_xy_pitch[:, 0] < 75.0)
+            if def_mask.sum() < 1:
+                def_mask = (player_team_ids == def_team)
+                if def_mask.sum() < 1:
+                    return None
+
+            def_xy = player_xy_pitch[def_mask]
+            def_ids = player_tracker_ids[def_mask]
+
+            # Defending goal at X = 0m (lowest X)
+            sorted_indices = np.argsort(def_xy[:, 0])  # Deepest defenders first
             if len(sorted_indices) >= 2:
                 sec_def_idx = sorted_indices[1]
             else:
@@ -221,6 +243,9 @@ class OffsideDetector:
             margin = offside_line_x - attacker_x
 
             is_offside = bool((attacker_x < self.halfway_x) and (attacker_x < offside_line_x - 0.05) and (attacker_x < ball_x - 0.05))
+
+        # Only activate HUD overlay if it is an actual OFFSIDE or a close decision (|margin| <= 5.0m)
+        should_display = is_offside or (abs(margin) <= 5.0)
 
         decision = OffsideDecision(
             pass_id=pass_event.pass_id,
@@ -237,12 +262,13 @@ class OffsideDetector:
             second_last_def_id=sec_def_id,
             second_last_def_x_m=round(sec_def_x, 2),
             ball_x_m=round(ball_x, 2),
-            display_until_frame=pass_event.frame_start + self.display_duration_frames,
+            display_until_frame=pass_event.frame_start + self.display_duration_frames if should_display else 0,
         )
 
         self._decisions.append(decision)
         self._checked_pass_ids.add(pass_event.pass_id)
-        self._active_decision = decision
+        if should_display:
+            self._active_decision = decision
 
         return decision
 

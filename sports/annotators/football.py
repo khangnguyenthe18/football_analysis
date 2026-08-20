@@ -575,47 +575,45 @@ def draw_player_speed_badges(
         return frame
 
     annotated = frame.copy()
-    palette = [sv.Color.from_hex(c).as_bgr() for c in (color_palette or ['#FF1493', '#00BFFF', '#FF6347', '#FFD700'])]
+    palette = [sv.Color.from_hex(c).as_bgr() for c in (color_palette or ['#FF1493', '#00BFFF'])]
 
     bottom_anchors = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
 
     for i, (tid, anchor) in enumerate(zip(detections.tracker_id, bottom_anchors)):
+        team_idx = int(custom_color_lookup[i]) if custom_color_lookup is not None and i < len(custom_color_lookup) else 0
+
+        # 1. Bỏ qua hoàn toàn trọng tài (chỉ hiển thị tốc độ cho cầu thủ 2 đội)
+        if team_idx not in (0, 1):
+            continue
+        if detections.class_id is not None and detections.class_id[i] == 2:  # REFEREE_CLASS_ID
+            continue
+
         tid = int(tid)
         speed = speed_tracker.get_player_speed_kmh(tid)
-        is_sprint = speed_tracker.is_player_sprinting(tid)
 
-        team_idx = int(custom_color_lookup[i]) if custom_color_lookup is not None and i < len(custom_color_lookup) else 0
+        # 2. Màu sắc cố định 100% theo đội (Hồng & Xanh), không bị đổi màu vàng/cam
         team_bgr = palette[team_idx % len(palette)]
-
         ax, ay = int(anchor[0]), int(anchor[1])
 
         label = f"#{tid} {speed:.1f} km/h"
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.45
+        font_scale = 0.42
         thickness = 1
         (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
 
-        badge_w = tw + 14
+        badge_w = tw + 12
         badge_h = th + 8
         bx1 = ax - badge_w // 2
         by1 = ay + 4
         bx2 = bx1 + badge_w
         by2 = by1 + badge_h
 
-        if is_sprint:
-            # Sprint Highlight Aura (Gold/Orange)
-            sprint_color = (0, 165, 255)
-            cv2.ellipse(annotated, (ax, ay), (24, 10), 0, 0, 360, sprint_color, 2, cv2.LINE_AA)
-            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (15, 15, 15), -1)
-            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), sprint_color, 2)
-            cv2.putText(annotated, label, (bx1 + 7, by2 - 4), font, font_scale, sprint_color, 2, cv2.LINE_AA)
-        else:
-            # Normal Speed Pill Badge
-            overlay = annotated.copy()
-            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (20, 20, 20), -1)
-            cv2.addWeighted(overlay, 0.7, annotated, 0.3, 0, annotated)
-            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), team_bgr, 1)
-            cv2.putText(annotated, label, (bx1 + 7, by2 - 4), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        # Khung tốc độ nền tối mờ với viền màu đội bóng đồng nhất
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (18, 20, 26), -1)
+        cv2.addWeighted(overlay, 0.75, annotated, 0.25, 0, annotated)
+        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), team_bgr, 1, cv2.LINE_AA)
+        cv2.putText(annotated, label, (bx1 + 6, by2 - 4), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     return annotated
 
@@ -740,7 +738,7 @@ def draw_offside_line_on_frame(
     config: SoccerPitchConfiguration,
 ) -> np.ndarray:
     """
-    Renders 3D perspective offside laser line on the video frame with VAR HUD graphic.
+    Renders 3D perspective transversal offside laser line on the video frame with VAR HUD graphic.
 
     Args:
         frame: The video frame to annotate.
@@ -757,12 +755,10 @@ def draw_offside_line_on_frame(
     annotated = frame.copy()
     h, w = annotated.shape[:2]
 
-    # Calculate 3D perspective line endpoints across full pitch width (0 to 7000 cm)
+    # Sample multiple points across the transversal line (Y from 0 to 7000 cm)
     line_x_cm = decision.offside_line_x_m * 100.0
-    pitch_points = np.array([
-        [line_x_cm, 0.0],
-        [line_x_cm, float(config.width)],
-    ], dtype=np.float32)
+    y_samples = np.linspace(0.0, float(config.width), num=25, dtype=np.float32)
+    pitch_points = np.stack([np.full_like(y_samples, line_x_cm), y_samples], axis=-1)
 
     pixel_pts = view_transformer.inverse_transform_points(pitch_points)
 
@@ -770,14 +766,15 @@ def draw_offside_line_on_frame(
     laser_color = (0, 0, 255) if is_offside else (0, 230, 100)  # Red for Offside, Green for Onside
     glow_color = (0, 0, 180) if is_offside else (0, 150, 50)
 
-    if len(pixel_pts) == 2:
-        pt1 = (int(pixel_pts[0][0]), int(pixel_pts[0][1]))
-        pt2 = (int(pixel_pts[1][0]), int(pixel_pts[1][1]))
+    # Filter on-screen valid projected points
+    valid_mask = (pixel_pts[:, 0] >= -100) & (pixel_pts[:, 0] <= w + 100) & \
+                 (pixel_pts[:, 1] >= -100) & (pixel_pts[:, 1] <= h + 100)
+    valid_pts = pixel_pts[valid_mask].astype(np.int32)
 
-        # Outer glow line
-        cv2.line(annotated, pt1, pt2, glow_color, 6, cv2.LINE_AA)
-        # Inner sharp laser line
-        cv2.line(annotated, pt1, pt2, laser_color, 2, cv2.LINE_AA)
+    if len(valid_pts) >= 2:
+        # Draw perspective laser line across the pitch
+        cv2.polylines(annotated, [valid_pts], isClosed=False, color=glow_color, thickness=6, lineType=cv2.LINE_AA)
+        cv2.polylines(annotated, [valid_pts], isClosed=False, color=laser_color, thickness=2, lineType=cv2.LINE_AA)
 
     # Broadcast VAR Check Graphic HUD (Top-Right)
     hud_w = 340

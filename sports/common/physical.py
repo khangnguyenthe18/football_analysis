@@ -93,7 +93,7 @@ class PlayerSpeedTracker:
     ) -> None:
         self.fps = fps
         self.dt = 1.0 / max(fps, 1.0)
-        self.window_size = max(3, window_size)
+        self.window_size = max(5, window_size)
         self.deadband_speed_kmh = deadband_speed_kmh
         self.max_human_speed_kmh = max_human_speed_kmh
         self.sprint_threshold_kmh = sprint_threshold_kmh
@@ -101,6 +101,7 @@ class PlayerSpeedTracker:
 
         # Player storage
         self._positions: Dict[int, Deque[Tuple[int, float, float]]] = {}
+        self._smoothed_pos: Dict[int, Tuple[float, float]] = {}
         self._player_teams: Dict[int, int] = {}
         self._current_speeds: Dict[int, float] = {}
         self._max_speeds: Dict[int, float] = {}
@@ -153,7 +154,16 @@ class PlayerSpeedTracker:
         for pos, pid, tid in zip(player_xy_pitch, player_tracker_ids, player_team_ids):
             pid = int(pid)
             tid = int(tid)
-            x, y = float(pos[0]), float(pos[1])
+            raw_x, raw_y = float(pos[0]), float(pos[1])
+
+            # Apply Exponential Moving Average (EMA) to pitch coordinates to filter homography jitter
+            if pid in self._smoothed_pos:
+                prev_sx, prev_sy = self._smoothed_pos[pid]
+                sx = 0.3 * raw_x + 0.7 * prev_sx
+                sy = 0.3 * raw_y + 0.7 * prev_sy
+            else:
+                sx, sy = raw_x, raw_y
+            self._smoothed_pos[pid] = (sx, sy)
 
             # Initialize structures if first seen
             if pid not in self._positions:
@@ -171,7 +181,7 @@ class PlayerSpeedTracker:
 
             self._player_teams[pid] = tid
             self._active_frames[pid] += 1
-            self._positions[pid].append((frame_id, x, y))
+            self._positions[pid].append((frame_id, sx, sy))
 
             # Calculate smoothed speed using sliding window displacement
             pos_history = list(self._positions[pid])
@@ -179,45 +189,48 @@ class PlayerSpeedTracker:
                 oldest_f, oldest_x, oldest_y = pos_history[0]
                 delta_frames = frame_id - oldest_f
 
-                if delta_frames > 0:
+                if delta_frames >= 2:
                     dt_span = delta_frames * self.dt
-                    dx = x - oldest_x
-                    dy = y - oldest_y
+                    dx = sx - oldest_x
+                    dy = sy - oldest_y
                     dist_span = float(np.sqrt(dx * dx + dy * dy))
-                    raw_speed_ms = dist_span / dt_span
-                    raw_speed_kmh = raw_speed_ms * 3.6
+                    calc_speed_kmh = (dist_span / dt_span) * 3.6
 
-                    # Apply realistic speed ceiling
-                    speed_kmh = min(raw_speed_kmh, self.max_human_speed_kmh)
+                    # Apply realistic speed ceiling (maximum 34 km/h for soccer sprint)
+                    calc_speed_kmh = min(calc_speed_kmh, 34.0)
 
-                    # Deadband filter for standing jitter
-                    if speed_kmh < self.deadband_speed_kmh:
-                        speed_kmh = 0.0
+                    # Deadband filter for standing/micro-jitter
+                    if calc_speed_kmh < self.deadband_speed_kmh:
+                        calc_speed_kmh = 0.0
+
+                    # EMA filter on velocity to eliminate sudden frame spikes
+                    prev_speed = self._current_speeds.get(pid, 0.0)
+                    speed_kmh = 0.25 * calc_speed_kmh + 0.75 * prev_speed
                 else:
-                    speed_kmh = self._current_speeds[pid]
+                    speed_kmh = self._current_speeds.get(pid, 0.0)
             else:
                 speed_kmh = 0.0
 
             # Store current and max speed
-            self._current_speeds[pid] = speed_kmh
+            self._current_speeds[pid] = round(speed_kmh, 1)
             self._speed_histories[pid].append(speed_kmh)
             if speed_kmh > self._max_speeds[pid]:
-                self._max_speeds[pid] = speed_kmh
+                self._max_speeds[pid] = round(speed_kmh, 1)
 
             # Accumulate frame-to-frame distance
             if pid in self._last_positions:
                 last_x, last_y = self._last_positions[pid]
-                step_dx = x - last_x
-                step_dy = y - last_y
+                step_dx = sx - last_x
+                step_dy = sy - last_y
                 step_dist = float(np.sqrt(step_dx * step_dx + step_dy * step_dy))
 
-                # Accumulate distance only if speed exceeds deadband and step is realistic (< 3m per frame)
-                if speed_kmh >= self.deadband_speed_kmh and step_dist < 3.0:
+                # Accumulate distance only if speed exceeds deadband and step is realistic (< 1.5m per frame)
+                if speed_kmh >= self.deadband_speed_kmh and step_dist < 1.5:
                     self._total_distances[pid] += step_dist
                     zone = self._classify_zone(speed_kmh)
                     self._zone_distances[pid][zone] += step_dist
 
-            self._last_positions[pid] = (x, y)
+            self._last_positions[pid] = (sx, sy)
 
             # Accumulate time in zone
             zone = self._classify_zone(speed_kmh)
