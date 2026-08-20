@@ -58,6 +58,34 @@ class ViewTransformer:
         transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
         return transformed_points.reshape(-1, 2).astype(np.float32)
 
+    def inverse_transform_points(
+            self,
+            points: npt.NDArray[np.float32]
+    ) -> npt.NDArray[np.float32]:
+        """
+        Transform points from target coordinate system (pitch cm) back to source coordinate system (image pixels)
+        using the inverse homography matrix.
+
+        Args:
+            points (npt.NDArray[np.float32]): Points in target coordinates to be inversely transformed.
+
+        Returns:
+            npt.NDArray[np.float32]: Inversely transformed points in source coordinates.
+        """
+        if points.size == 0:
+            return points
+
+        if points.shape[1] != 2:
+            raise ValueError("Points must be 2D coordinates.")
+
+        try:
+            m_inv = np.linalg.inv(self.m)
+            reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
+            transformed_points = cv2.perspectiveTransform(reshaped_points, m_inv)
+            return transformed_points.reshape(-1, 2).astype(np.float32)
+        except np.linalg.LinAlgError:
+            return np.empty((0, 2), dtype=np.float32)
+
     def transform_image(
             self,
             image: npt.NDArray[np.uint8],

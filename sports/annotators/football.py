@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple, Any
 
 import cv2
 import supervision as sv
@@ -304,3 +304,603 @@ def draw_pitch_voronoi_diagram(
     overlay = cv2.addWeighted(voronoi, opacity, pitch, 1 - opacity, 0)
 
     return overlay
+
+
+def draw_pitch_heatmap(
+    config: SoccerPitchConfiguration,
+    density_grid: np.ndarray,
+    colormap: int = cv2.COLORMAP_JET,
+    opacity: float = 0.65,
+    threshold: float = 0.08,
+    padding: int = 50,
+    scale: float = 0.1,
+    title: Optional[str] = None,
+    pitch: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Renders a smooth 2D density heatmap on top of a soccer pitch diagram.
+
+    Args:
+        config: Pitch configuration with metric dimensions.
+        density_grid: 2D numpy array [0.0, 1.0] representing spatial density.
+        colormap: OpenCV colormap (default cv2.COLORMAP_JET).
+        opacity: Heatmap overlay blending factor (0.0 to 1.0).
+        threshold: Minimum density value to display (below this, pitch grass is visible).
+        padding: Padding around pitch in pixels.
+        scale: Scale factor for pitch dimensions.
+        title: Optional title string to display on top banner.
+        pitch: Optional existing pitch image to draw on.
+
+    Returns:
+        np.ndarray: Pitch image with heatmap overlay.
+    """
+    if pitch is None:
+        pitch = draw_pitch(config=config, padding=padding, scale=scale)
+
+    scaled_width = int(config.width * scale)
+    scaled_length = int(config.length * scale)
+
+    if density_grid is None or density_grid.size == 0 or np.max(density_grid) == 0:
+        return pitch
+
+    # Resize density grid to match inner pitch dimensions
+    grid_normalized = np.clip(density_grid, 0.0, 1.0)
+    resized_grid = cv2.resize(
+        grid_normalized,
+        (scaled_length, scaled_width),
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    # Colorize using OpenCV colormap
+    grid_u8 = (resized_grid * 255).astype(np.uint8)
+    colored_heatmap = cv2.applyColorMap(grid_u8, colormap)
+
+    # Place colored heatmap inside padded pitch region
+    full_overlay = pitch.copy()
+    inner_roi = full_overlay[padding:padding + scaled_width, padding:padding + scaled_length]
+
+    # Create smooth mask based on threshold
+    mask = (resized_grid >= threshold).astype(np.float32)[:, :, None]
+
+    # Alpha blend inner region
+    blended_inner = (
+        colored_heatmap * (opacity * mask) +
+        inner_roi * (1.0 - opacity * mask)
+    ).astype(np.uint8)
+
+    full_overlay[padding:padding + scaled_width, padding:padding + scaled_length] = blended_inner
+
+    # Redraw pitch lines on top for crisp field markings
+    line_color = sv.Color.WHITE.as_bgr()
+    for start, end in config.edges:
+        pt1 = (int(config.vertices[start - 1][0] * scale) + padding,
+               int(config.vertices[start - 1][1] * scale) + padding)
+        pt2 = (int(config.vertices[end - 1][0] * scale) + padding,
+               int(config.vertices[end - 1][1] * scale) + padding)
+        cv2.line(full_overlay, pt1, pt2, line_color, 2, cv2.LINE_AA)
+
+    # Centre circle
+    centre_circle_center = (
+        scaled_length // 2 + padding,
+        scaled_width // 2 + padding
+    )
+    cv2.circle(
+        full_overlay, centre_circle_center,
+        int(config.centre_circle_radius * scale),
+        line_color, 2, cv2.LINE_AA
+    )
+
+    # Penalty spots
+    penalty_spots = [
+        (int(config.penalty_spot_distance * scale) + padding, scaled_width // 2 + padding),
+        (scaled_length - int(config.penalty_spot_distance * scale) + padding, scaled_width // 2 + padding)
+    ]
+    for spot in penalty_spots:
+        cv2.circle(full_overlay, spot, 5, line_color, -1, cv2.LINE_AA)
+
+    # Optional Title Banner
+    if title:
+        h, w = full_overlay.shape[:2]
+        banner_h = 36
+        banner = full_overlay.copy()
+        cv2.rectangle(banner, (0, 0), (w, banner_h), (20, 20, 20), -1)
+        cv2.addWeighted(banner, 0.75, full_overlay, 0.25, 0, full_overlay)
+        cv2.putText(
+            full_overlay, title, (20, 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA
+        )
+
+    return full_overlay
+
+
+def draw_passing_network(
+    config: SoccerPitchConfiguration,
+    player_positions: Dict[int, Tuple[float, float]],
+    pass_connections: List[Tuple[int, int, int]],
+    player_involvements: Dict[int, int],
+    team_color: sv.Color = sv.Color.from_hex('#FF1493'),
+    team_name: str = "Team",
+    total_passes: int = 0,
+    min_node_radius: int = 14,
+    max_node_radius: int = 28,
+    min_edge_thickness: int = 2,
+    max_edge_thickness: int = 8,
+    padding: int = 50,
+    scale: float = 0.1,
+    pitch: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Renders a tactical passing network diagram on the 2D soccer pitch.
+
+    Args:
+        config: Pitch configuration with metric dimensions.
+        player_positions: Mapping of player_id -> (x_m, y_m) average position in meters.
+        pass_connections: List of (player_a, player_b, pass_count) tuples.
+        player_involvements: Mapping of player_id -> total pass count.
+        team_color: Color representing the team nodes.
+        team_name: Name of the team for the header banner.
+        total_passes: Total completed passes count.
+        min_node_radius: Minimum player circle radius.
+        max_node_radius: Maximum player circle radius.
+        min_edge_thickness: Minimum pass connection line thickness.
+        max_edge_thickness: Maximum pass connection line thickness.
+        padding: Padding around pitch in pixels.
+        scale: Scale factor for pitch dimensions.
+        pitch: Optional existing pitch image.
+
+    Returns:
+        np.ndarray: Annotated passing network diagram image.
+    """
+    if pitch is None:
+        pitch = draw_pitch(
+            config=config,
+            background_color=sv.Color(28, 33, 39),  # Modern dark slate pitch
+            line_color=sv.Color(120, 130, 140),
+            padding=padding,
+            scale=scale
+        )
+
+    img = pitch.copy()
+    color_bgr = team_color.as_bgr()
+
+    # Convert meter positions to pixel coordinates
+    pixel_positions: Dict[int, Tuple[int, int]] = {}
+    for pid, (xm, ym) in player_positions.items():
+        px = int(xm * 100 * scale) + padding
+        py = int(ym * 100 * scale) + padding
+        pixel_positions[pid] = (px, py)
+
+    # 1. Draw Pass Connections (Edges)
+    if pass_connections:
+        max_passes = max([c[2] for c in pass_connections] + [1])
+        for p1, p2, count in pass_connections:
+            if p1 not in pixel_positions or p2 not in pixel_positions:
+                continue
+
+            pt1 = pixel_positions[p1]
+            pt2 = pixel_positions[p2]
+
+            # Thickness proportional to pass count
+            rel_strength = count / max_passes
+            thickness = int(min_edge_thickness + rel_strength * (max_edge_thickness - min_edge_thickness))
+
+            # Edge line with slight transparency
+            edge_overlay = img.copy()
+            cv2.line(edge_overlay, pt1, pt2, color_bgr, thickness, cv2.LINE_AA)
+            cv2.addWeighted(edge_overlay, 0.75, img, 0.25, 0, img)
+
+            # Draw small pass count badge midway if passes >= 2
+            if count >= 2:
+                mid_x = (pt1[0] + pt2[0]) // 2
+                mid_y = (pt1[1] + pt2[1]) // 2
+                cv2.circle(img, (mid_x, mid_y), 9, (20, 20, 20), -1, cv2.LINE_AA)
+                cv2.circle(img, (mid_x, mid_y), 9, color_bgr, 1, cv2.LINE_AA)
+                cv2.putText(
+                    img, str(count), (mid_x - 4, mid_y + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA
+                )
+
+    # 2. Draw Player Nodes
+    max_inv = max(list(player_involvements.values()) + [1])
+    for pid, pt in pixel_positions.items():
+        inv = player_involvements.get(pid, 1)
+        rel_inv = inv / max_inv
+        radius = int(min_node_radius + rel_inv * (max_node_radius - min_node_radius))
+
+        # Node shadow/glow
+        cv2.circle(img, pt, radius + 3, (10, 10, 10), -1, cv2.LINE_AA)
+        # Node body
+        cv2.circle(img, pt, radius, color_bgr, -1, cv2.LINE_AA)
+        # Node border
+        cv2.circle(img, pt, radius, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Player ID label inside node
+        label = str(pid)
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        text_x = pt[0] - text_size[0] // 2
+        text_y = pt[1] + text_size[1] // 2
+        cv2.putText(
+            img, label, (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+        )
+
+    # 3. Header Title & Stats Banner
+    h, w = img.shape[:2]
+    banner_h = 44
+    banner = img.copy()
+    cv2.rectangle(banner, (0, 0), (w, banner_h), (15, 18, 22), -1)
+    cv2.addWeighted(banner, 0.85, img, 0.15, 0, img)
+    cv2.rectangle(img, (0, 0), (w, banner_h), (60, 65, 75), 1)
+
+    # Team color indicator bar
+    cv2.rectangle(img, (12, 10), (18, banner_h - 10), color_bgr, -1)
+
+    title_text = f"{team_name.upper()} - PASSING NETWORK"
+    cv2.putText(
+        img, title_text, (28, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA
+    )
+
+    stats_text = f"Completed Passes: {total_passes}  |  Active Players: {len(pixel_positions)}"
+    stats_size = cv2.getTextSize(stats_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+    cv2.putText(
+        img, stats_text, (w - stats_size[0] - 20, 27),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (190, 200, 210), 1, cv2.LINE_AA
+    )
+
+    return img
+
+
+def draw_player_speed_badges(
+    frame: np.ndarray,
+    detections: sv.Detections,
+    speed_tracker: Any,
+    custom_color_lookup: Optional[np.ndarray] = None,
+    color_palette: Optional[List[str]] = None,
+) -> np.ndarray:
+    """
+    Renders live speed tags and sprint highlights below detected players.
+
+    Args:
+        frame: The video frame to annotate.
+        detections: Player detections containing bounding boxes and tracker IDs.
+        speed_tracker: PlayerSpeedTracker instance.
+        custom_color_lookup: Optional array mapping detection index to team/color index.
+        color_palette: Hex color list for teams.
+
+    Returns:
+        np.ndarray: Annotated video frame.
+    """
+    if len(detections) == 0 or detections.tracker_id is None:
+        return frame
+
+    annotated = frame.copy()
+    palette = [sv.Color.from_hex(c).as_bgr() for c in (color_palette or ['#FF1493', '#00BFFF', '#FF6347', '#FFD700'])]
+
+    bottom_anchors = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+
+    for i, (tid, anchor) in enumerate(zip(detections.tracker_id, bottom_anchors)):
+        tid = int(tid)
+        speed = speed_tracker.get_player_speed_kmh(tid)
+        is_sprint = speed_tracker.is_player_sprinting(tid)
+
+        team_idx = int(custom_color_lookup[i]) if custom_color_lookup is not None and i < len(custom_color_lookup) else 0
+        team_bgr = palette[team_idx % len(palette)]
+
+        ax, ay = int(anchor[0]), int(anchor[1])
+
+        label = f"#{tid} {speed:.1f} km/h"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        thickness = 1
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+        badge_w = tw + 14
+        badge_h = th + 8
+        bx1 = ax - badge_w // 2
+        by1 = ay + 4
+        bx2 = bx1 + badge_w
+        by2 = by1 + badge_h
+
+        if is_sprint:
+            # Sprint Highlight Aura (Gold/Orange)
+            sprint_color = (0, 165, 255)
+            cv2.ellipse(annotated, (ax, ay), (24, 10), 0, 0, 360, sprint_color, 2, cv2.LINE_AA)
+            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (15, 15, 15), -1)
+            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), sprint_color, 2)
+            cv2.putText(annotated, label, (bx1 + 7, by2 - 4), font, font_scale, sprint_color, 2, cv2.LINE_AA)
+        else:
+            # Normal Speed Pill Badge
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (20, 20, 20), -1)
+            cv2.addWeighted(overlay, 0.7, annotated, 0.3, 0, annotated)
+            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), team_bgr, 1)
+            cv2.putText(annotated, label, (bx1 + 7, by2 - 4), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return annotated
+
+
+def draw_physical_dashboard(
+    team_0_stats: List[Any],
+    team_1_stats: List[Any],
+    team_0_color: sv.Color = sv.Color.from_hex('#FF1493'),
+    team_1_color: sv.Color = sv.Color.from_hex('#00BFFF'),
+    team_0_name: str = "Team 1",
+    team_1_name: str = "Team 2",
+    width: int = 1200,
+    height: int = 700,
+) -> np.ndarray:
+    """
+    Renders a comprehensive TV-broadcast style post-match athletic performance dashboard.
+
+    Args:
+        team_0_stats: List of PlayerPhysicalStats for Team 1.
+        team_1_stats: List of PlayerPhysicalStats for Team 2.
+        team_0_color: Primary color for Team 1.
+        team_1_color: Primary color for Team 2.
+        team_0_name: Name of Team 1.
+        team_1_name: Name of Team 2.
+        width: Output canvas width in pixels.
+        height: Output canvas height in pixels.
+
+    Returns:
+        np.ndarray: Dashboard image.
+    """
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:] = (22, 26, 32)  # Dark slate background
+
+    c0 = team_0_color.as_bgr()
+    c1 = team_1_color.as_bgr()
+
+    # 1. Header Banner
+    header_h = 60
+    cv2.rectangle(canvas, (0, 0), (width, header_h), (14, 16, 20), -1)
+    cv2.line(canvas, (0, header_h), (width, header_h), (50, 55, 65), 1)
+
+    cv2.putText(canvas, "MATCH PHYSICAL & WORKRATE DASHBOARD", (25, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # 2. Team Overview Cards (Top Half)
+    col_w = (width - 60) // 2
+    y_card = header_h + 20
+    card_h = 240
+
+    def draw_team_card(x: int, name: str, color: Tuple[int, int, int], stats: List[Any]):
+        # Card Background
+        cv2.rectangle(canvas, (x, y_card), (x + col_w, y_card + card_h), (30, 35, 43), -1)
+        cv2.rectangle(canvas, (x, y_card), (x + col_w, y_card + card_h), (60, 65, 75), 1)
+        # Accent top bar
+        cv2.rectangle(canvas, (x, y_card), (x + col_w, y_card + 4), color, -1)
+
+        # Team Title
+        cv2.putText(canvas, name.upper(), (x + 20, y_card + 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+        # Team aggregates
+        total_dist_km = sum([s.total_distance_km for s in stats])
+        total_sprints = sum([s.sprint_count for s in stats])
+        peak_speed = max([s.max_speed_kmh for s in stats] + [0.0])
+
+        metrics = [
+            ("Total Distance Covered", f"{total_dist_km:.2f} km"),
+            ("Peak Sprint Speed", f"{peak_speed:.1f} km/h"),
+            ("Total Sprint Bursts", f"{total_sprints}"),
+            ("Active Tracked Players", f"{len(stats)} players"),
+        ]
+
+        for i, (label, val) in enumerate(metrics):
+            my = y_card + 75 + i * 38
+            cv2.putText(canvas, label, (x + 20, my),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 180, 190), 1, cv2.LINE_AA)
+            cv2.putText(canvas, val, (x + col_w - 140, my),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+
+    draw_team_card(20, team_0_name, c0, team_0_stats)
+    draw_team_card(40 + col_w, team_1_name, c1, team_1_stats)
+
+    # 3. Leaderboards (Bottom Half): Top Speeds & Top Distances
+    y_table = y_card + card_h + 20
+    table_h = height - y_table - 20
+
+    def draw_top_players_table(x: int, title: str, players_sorted: List[Any], metric_fn, unit: str, color: Tuple[int, int, int]):
+        cv2.rectangle(canvas, (x, y_table), (x + col_w, y_table + table_h), (30, 35, 43), -1)
+        cv2.rectangle(canvas, (x, y_table), (x + col_w, y_table + table_h), (60, 65, 75), 1)
+
+        cv2.putText(canvas, title, (x + 20, y_table + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+        for rank, p in enumerate(players_sorted[:5]):
+            py = y_table + 68 + rank * 44
+            rank_str = f"#{rank + 1}"
+            cv2.putText(canvas, rank_str, (x + 20, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 150, 160), 1, cv2.LINE_AA)
+
+            player_str = f"Player #{p.player_id}"
+            cv2.putText(canvas, player_str, (x + 65, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 235, 240), 1, cv2.LINE_AA)
+
+            val_str = f"{metric_fn(p):.1f} {unit}"
+            cv2.putText(canvas, val_str, (x + col_w - 130, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+    all_players = team_0_stats + team_1_stats
+    top_speed_players = sorted(all_players, key=lambda s: s.max_speed_kmh, reverse=True)
+    top_dist_players = sorted(all_players, key=lambda s: s.total_distance_m, reverse=True)
+
+    draw_top_players_table(20, "TOP SPEED LEADERBOARD (KM/H)", top_speed_players, lambda s: s.max_speed_kmh, "km/h", (0, 215, 255))
+    draw_top_players_table(40 + col_w, "TOP DISTANCE COVERED (METERS)", top_dist_players, lambda s: s.total_distance_m, "m", (100, 255, 120))
+
+    return canvas
+
+
+def draw_offside_line_on_frame(
+    frame: np.ndarray,
+    decision: Any,
+    view_transformer: Any,
+    config: SoccerPitchConfiguration,
+) -> np.ndarray:
+    """
+    Renders 3D perspective offside laser line on the video frame with VAR HUD graphic.
+
+    Args:
+        frame: The video frame to annotate.
+        decision: OffsideDecision record.
+        view_transformer: ViewTransformer instance with inverse_transform_points.
+        config: SoccerPitchConfiguration.
+
+    Returns:
+        np.ndarray: Annotated frame with offside laser line and VAR banner.
+    """
+    if decision is None or view_transformer is None:
+        return frame
+
+    annotated = frame.copy()
+    h, w = annotated.shape[:2]
+
+    # Calculate 3D perspective line endpoints across full pitch width (0 to 7000 cm)
+    line_x_cm = decision.offside_line_x_m * 100.0
+    pitch_points = np.array([
+        [line_x_cm, 0.0],
+        [line_x_cm, float(config.width)],
+    ], dtype=np.float32)
+
+    pixel_pts = view_transformer.inverse_transform_points(pitch_points)
+
+    is_offside = decision.is_offside
+    laser_color = (0, 0, 255) if is_offside else (0, 230, 100)  # Red for Offside, Green for Onside
+    glow_color = (0, 0, 180) if is_offside else (0, 150, 50)
+
+    if len(pixel_pts) == 2:
+        pt1 = (int(pixel_pts[0][0]), int(pixel_pts[0][1]))
+        pt2 = (int(pixel_pts[1][0]), int(pixel_pts[1][1]))
+
+        # Outer glow line
+        cv2.line(annotated, pt1, pt2, glow_color, 6, cv2.LINE_AA)
+        # Inner sharp laser line
+        cv2.line(annotated, pt1, pt2, laser_color, 2, cv2.LINE_AA)
+
+    # Broadcast VAR Check Graphic HUD (Top-Right)
+    hud_w = 340
+    hud_h = 74
+    hx1 = w - hud_w - 20
+    hy1 = 20
+    hx2 = hx1 + hud_w
+    hy2 = hy1 + hud_h
+
+    overlay = annotated.copy()
+    cv2.rectangle(overlay, (hx1, hy1), (hx2, hy2), (15, 18, 24), -1)
+    cv2.addWeighted(overlay, 0.85, annotated, 0.15, 0, annotated)
+    cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2), (70, 75, 85), 1)
+
+    # Accent left status bar
+    cv2.rectangle(annotated, (hx1, hy1), (hx1 + 6, hy2), laser_color, -1)
+
+    # Title with VAR icon
+    cv2.putText(annotated, "VAR CHECK - OFFSIDE TECHNOLOGY", (hx1 + 16, hy1 + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 210, 220), 1, cv2.LINE_AA)
+
+    # Verdict text
+    if is_offside:
+        verdict = f"OFFSIDE: +{decision.margin_cm:.1f} cm"
+    else:
+        verdict = f"ONSIDE: {decision.margin_cm:.1f} cm"
+
+    cv2.putText(annotated, verdict, (hx1 + 16, hy1 + 46),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, laser_color, 2, cv2.LINE_AA)
+
+    # Subtext: Passer & Receiver
+    subtext = f"Passer #{decision.passer_id} -> Receiver #{decision.receiver_id}"
+    cv2.putText(annotated, subtext, (hx1 + 16, hy1 + 64),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 170, 180), 1, cv2.LINE_AA)
+
+    return annotated
+
+
+def draw_offside_pitch_snapshot(
+    config: SoccerPitchConfiguration,
+    decision: Any,
+    player_xy_pitch: np.ndarray,
+    player_ids: np.ndarray,
+    player_teams: np.ndarray,
+    team_colors: Tuple[sv.Color, sv.Color] = (sv.Color.from_hex('#FF1493'), sv.Color.from_hex('#00BFFF')),
+    padding: int = 50,
+    scale: float = 0.1,
+) -> np.ndarray:
+    """
+    Renders a 2D pitch metric snapshot showing player positions and offside line at kick-off moment.
+
+    Args:
+        config: SoccerPitchConfiguration.
+        decision: OffsideDecision instance.
+        player_xy_pitch: Shape (N, 2) player positions in meters.
+        player_ids: Shape (N,) player IDs.
+        player_teams: Shape (N,) team IDs.
+        team_colors: Tuple of team colors.
+        padding: Pitch padding in pixels.
+        scale: Pitch scale factor.
+
+    Returns:
+        np.ndarray: Annotated 2D snapshot image.
+    """
+    pitch = draw_pitch(
+        config=config,
+        background_color=sv.Color(24, 28, 34),
+        line_color=sv.Color(120, 130, 140),
+        padding=padding,
+        scale=scale
+    )
+
+    scaled_width = int(config.width * scale)
+    scaled_length = int(config.length * scale)
+
+    # 1. Draw Offside Line across 2D pitch
+    offside_x_px = int(decision.offside_line_x_m * 100.0 * scale) + padding
+    line_color = (0, 0, 255) if decision.is_offside else (0, 230, 100)
+
+    cv2.line(
+        pitch,
+        (offside_x_px, padding),
+        (offside_x_px, padding + scaled_width),
+        line_color, 2, cv2.LINE_AA
+    )
+
+    # 2. Draw Players
+    for pos, pid, tid in zip(player_xy_pitch, player_ids, player_teams):
+        pid = int(pid)
+        tid = int(tid)
+        px = int(pos[0] * 100.0 * scale) + padding
+        py = int(pos[1] * 100.0 * scale) + padding
+
+        p_color = team_colors[tid % 2].as_bgr()
+
+        # Highlight receiver or second-last defender
+        if pid == decision.receiver_id:
+            cv2.circle(pitch, (px, py), 16, line_color, 2, cv2.LINE_AA)
+            cv2.circle(pitch, (px, py), 12, p_color, -1, cv2.LINE_AA)
+        elif pid == decision.second_last_def_id:
+            cv2.circle(pitch, (px, py), 16, (0, 215, 255), 2, cv2.LINE_AA)
+            cv2.circle(pitch, (px, py), 12, p_color, -1, cv2.LINE_AA)
+        else:
+            cv2.circle(pitch, (px, py), 9, p_color, -1, cv2.LINE_AA)
+
+        cv2.putText(pitch, str(pid), (px - 5, py + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # 3. Banner Title
+    h, w = pitch.shape[:2]
+    banner_h = 44
+    cv2.rectangle(pitch, (0, 0), (w, banner_h), (14, 16, 20), -1)
+    cv2.line(pitch, (0, banner_h), (w, banner_h), (60, 65, 75), 1)
+
+    verdict = "OFFSIDE" if decision.is_offside else "ONSIDE"
+    title_str = f"SAOT VAR SNAPSHOT - PASS #{decision.pass_id} [{verdict}]"
+    cv2.putText(pitch, title_str, (25, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+    margin_str = f"Margin: {decision.margin_cm:+.1f} cm  |  Def Line: {decision.offside_line_x_m:.1f}m"
+    cv2.putText(pitch, margin_str, (w - 360, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1, cv2.LINE_AA)
+
+    return pitch
+
+

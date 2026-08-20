@@ -15,9 +15,21 @@ import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
 
-from sports.annotators.football import draw_pitch, draw_points_on_pitch
+from sports.annotators.football import (
+    draw_pitch,
+    draw_points_on_pitch,
+    draw_pitch_heatmap,
+    draw_passing_network,
+    draw_player_speed_badges,
+    draw_physical_dashboard,
+    draw_offside_line_on_frame,
+    draw_offside_pitch_snapshot,
+)
 from sports.common.ball import BallTracker, BallAnnotator
+from sports.common.offside import OffsideDetector
 from sports.common.pass_detector import PassDetector, PassAnnotator
+from sports.common.physical import PlayerSpeedTracker
+from sports.common.tactical import HeatmapTracker, PassingNetworkAnalyzer
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
 from sports.configs.football import SoccerPitchConfiguration
@@ -394,19 +406,27 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         yield annotated_frame
 
 
-def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_pass_detection(
+    source_video_path: str,
+    device: str,
+    reports_dir: str = 'reports',
+    show_speed: bool = True,
+) -> Iterator[np.ndarray]:
     """
     Run pass detection on a video and yield annotated frames.
 
     Combines player detection, tracking, team classification, ball detection,
     and pitch homography to feed a PassDetector FSM. Overlays pass arrows,
-    ball trails, and a live HUD scoreboard via PassAnnotator.
+    ball trails, live HUD scoreboard, and real-time player speed badges.
 
-    At the end of the video, prints a summary DataFrame to the console.
+    At the end of the video, exports tactical analytics (2D Heatmaps, Passing Network)
+    and athletic physical performance metrics (Speed, Distance, Physical Dashboard).
 
     Args:
         source_video_path (str): Path to the source video.
         device (str): Device to run the model on (e.g., 'cpu', 'cuda').
+        reports_dir (str): Directory where analytics PNGs and CSVs are saved.
+        show_speed (bool): Whether to render real-time speed badges on players.
 
     Yields:
         Iterator[np.ndarray]: Iterator over annotated frames.
@@ -429,12 +449,23 @@ def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
-    # --- Phase 2: Get video FPS for PassDetector timing ---
+    # --- Phase 2: Get video FPS for timing calculations ---
     video_info = sv.VideoInfo.from_video_path(source_video_path)
     fps = video_info.fps if video_info.fps else 30.0
 
-    # --- Initialize detectors and annotators ---
+    # --- Initialize detectors, tactical & physical trackers, and annotators ---
     pass_detector = PassDetector(fps=fps)
+    heatmap_tracker = HeatmapTracker(
+        pitch_length_m=CONFIG.length / 100.0,
+        pitch_width_m=CONFIG.width / 100.0
+    )
+    speed_tracker = PlayerSpeedTracker(fps=fps)
+    offside_detector = OffsideDetector(
+        pitch_length_m=CONFIG.length / 100.0,
+        pitch_width_m=CONFIG.width / 100.0,
+        display_duration_frames=int(fps * 1.6)
+    )
+
     pass_annotator = PassAnnotator(
         team_colors=(
             sv.Color.from_hex(COLORS[0]),
@@ -501,7 +532,7 @@ def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
         ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
         ball_detections = ball_tracker.update(ball_detections)
 
-        # --- Feed PassDetector (only if we have a valid transformer) ---
+        # --- Feed PassDetector, HeatmapTracker, PlayerSpeedTracker & OffsideDetector ---
         if current_transformer is not None:
             # Transform player positions to pitch coordinates (cm → meters)
             all_field_players = sv.Detections.merge([players, goalkeepers])
@@ -525,12 +556,53 @@ def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
                     ball_xy_pitch_cm = current_transformer.transform_points(ball_xy_pixel)
                     ball_xy_pitch_m = ball_xy_pitch_cm[0] / 100.0  # cm → meters
 
-                pass_detector.update(
+                # Update team attack directions periodically
+                if frame_id % 30 == 0:
+                    offside_detector.infer_attack_directions(player_xy_pitch_m, all_field_team_ids)
+
+                # Update pass detection FSM
+                pass_event = pass_detector.update(
                     frame_id=frame_id,
                     player_xy_pitch=player_xy_pitch_m,
                     player_tracker_ids=player_ids,
                     player_team_ids=all_field_team_ids,
                     ball_xy_pitch=ball_xy_pitch_m,
+                )
+
+                # Evaluate offside if a pass was resolved
+                if pass_event is not None:
+                    offside_dec = offside_detector.evaluate_pass(
+                        pass_event=pass_event,
+                        player_xy_pitch=player_xy_pitch_m,
+                        player_tracker_ids=player_ids,
+                        player_team_ids=all_field_team_ids,
+                        ball_xy_pitch=ball_xy_pitch_m,
+                    )
+                    if offside_dec is not None and offside_dec.is_offside:
+                        snap_img = draw_offside_pitch_snapshot(
+                            config=CONFIG,
+                            decision=offside_dec,
+                            player_xy_pitch=player_xy_pitch_m,
+                            player_ids=player_ids,
+                            player_teams=all_field_team_ids,
+                            team_colors=(sv.Color.from_hex(COLORS[0]), sv.Color.from_hex(COLORS[1])),
+                        )
+                        snap_path = os.path.join(reports_dir, f"offside_pass_{offside_dec.pass_id}.png")
+                        cv2.imwrite(snap_path, snap_img)
+
+                # Update trajectory tracker for heatmaps
+                heatmap_tracker.update(
+                    player_xy_pitch=player_xy_pitch_m,
+                    player_tracker_ids=player_ids,
+                    player_team_ids=all_field_team_ids,
+                )
+
+                # Update speed & physical tracker
+                speed_tracker.update(
+                    frame_id=frame_id,
+                    player_xy_pitch=player_xy_pitch_m,
+                    player_tracker_ids=player_ids,
+                    player_team_ids=all_field_team_ids,
                 )
 
         # --- Annotate frame ---
@@ -540,7 +612,14 @@ def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
         if len(all_detections) > 0:
             annotated_frame = ELLIPSE_ANNOTATOR.annotate(
                 annotated_frame, all_detections, custom_color_lookup=color_lookup)
-            if all_detections.tracker_id is not None:
+
+            if show_speed and current_transformer is not None:
+                # Live Speed Badges below feet with sprint highlights
+                annotated_frame = draw_player_speed_badges(
+                    annotated_frame, all_detections, speed_tracker,
+                    custom_color_lookup=color_lookup, color_palette=COLORS
+                )
+            elif all_detections.tracker_id is not None:
                 labels = [str(tid) for tid in all_detections.tracker_id]
                 annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
                     annotated_frame, all_detections, labels,
@@ -550,6 +629,13 @@ def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
         if current_transformer is not None:
             annotated_frame = pass_annotator.annotate(
                 annotated_frame, pass_detector, current_transformer, frame_id)
+
+            # Active 3D Perspective Offside Laser Line & VAR Banner
+            active_offside = offside_detector.get_active_decision(frame_id)
+            if active_offside is not None:
+                annotated_frame = draw_offside_line_on_frame(
+                    annotated_frame, active_offside, current_transformer, CONFIG
+                )
 
         frame_id += 1
         yield annotated_frame
@@ -567,8 +653,113 @@ def run_pass_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
     else:
         print("\nNo pass events detected.")
 
+    # --- Generate and Export Tactical, Physical & VAR Analytics ---
+    os.makedirs(reports_dir, exist_ok=True)
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+    # 1. 2D Positional Heatmaps
+    density_0 = heatmap_tracker.generate_density_grid(team_id=0)
+    density_1 = heatmap_tracker.generate_density_grid(team_id=1)
+
+    img_hm_0 = draw_pitch_heatmap(
+        config=CONFIG,
+        density_grid=density_0,
+        title="Team 1 - Positional Heatmap",
+        colormap=cv2.COLORMAP_JET
+    )
+    img_hm_1 = draw_pitch_heatmap(
+        config=CONFIG,
+        density_grid=density_1,
+        title="Team 2 - Positional Heatmap",
+        colormap=cv2.COLORMAP_HOT
+    )
+
+    hm0_path = os.path.join(reports_dir, "team_1_heatmap.png")
+    hm1_path = os.path.join(reports_dir, "team_2_heatmap.png")
+    cv2.imwrite(hm0_path, img_hm_0)
+    cv2.imwrite(hm1_path, img_hm_1)
+
+    # 2. Passing Networks
+    passing_analyzer = PassingNetworkAnalyzer()
+    passing_analyzer.update_events(pass_detector.events)
+    net_0 = passing_analyzer.compute_network(team_id=0, heatmap_tracker=heatmap_tracker, min_passes=1)
+    net_1 = passing_analyzer.compute_network(team_id=1, heatmap_tracker=heatmap_tracker, min_passes=1)
+
+    img_net_0 = draw_passing_network(
+        config=CONFIG,
+        player_positions=net_0.player_positions,
+        pass_connections=net_0.pass_connections,
+        player_involvements=net_0.player_involvements,
+        team_color=sv.Color.from_hex(COLORS[0]),
+        team_name="Team 1",
+        total_passes=net_0.total_completed_passes
+    )
+    img_net_1 = draw_passing_network(
+        config=CONFIG,
+        player_positions=net_1.player_positions,
+        pass_connections=net_1.pass_connections,
+        player_involvements=net_1.player_involvements,
+        team_color=sv.Color.from_hex(COLORS[1]),
+        team_name="Team 2",
+        total_passes=net_1.total_completed_passes
+    )
+
+    net0_path = os.path.join(reports_dir, "team_1_passing_network.png")
+    net1_path = os.path.join(reports_dir, "team_2_passing_network.png")
+    cv2.imwrite(net0_path, img_net_0)
+    cv2.imwrite(net1_path, img_net_1)
+
+    # 3. Physical Performance & Speed Analytics
+    df_physical = speed_tracker.get_summary_dataframe()
+    phys_csv_path = os.path.join(reports_dir, "physical_stats.csv")
+    if not df_physical.empty:
+        df_physical.to_csv(phys_csv_path, index=False)
+
+    team_0_phys = speed_tracker.get_team_stats(0)
+    team_1_phys = speed_tracker.get_team_stats(1)
+    img_physical_dash = draw_physical_dashboard(
+        team_0_stats=team_0_phys,
+        team_1_stats=team_1_phys,
+        team_0_color=sv.Color.from_hex(COLORS[0]),
+        team_1_color=sv.Color.from_hex(COLORS[1]),
+        team_0_name="Team 1",
+        team_1_name="Team 2",
+    )
+    phys_dash_path = os.path.join(reports_dir, "physical_dashboard.png")
+    cv2.imwrite(phys_dash_path, img_physical_dash)
+
+    # 4. Offside & SAOT VAR Decisions
+    df_offside = offside_detector.get_summary_dataframe()
+    offside_csv_path = os.path.join(reports_dir, "offside_summary.csv")
+    if not df_offside.empty:
+        df_offside.to_csv(offside_csv_path, index=False)
+
+    print("\n" + "=" * 70)
+    print("ANALYTICS & PHYSICAL PERFORMANCE REPORTS GENERATED")
+    print("=" * 70)
+    print(f"Reports saved to folder: '{os.path.abspath(reports_dir)}'")
+    print(f"  [+] Heatmap Team 1:          {hm0_path}")
+    print(f"  [+] Heatmap Team 2:          {hm1_path}")
+    print(f"  [+] Passing Network Team 1:  {net0_path}")
+    print(f"  [+] Passing Network Team 2:  {net1_path}")
+    print(f"  [+] Physical Stats CSV:      {phys_csv_path}")
+    print(f"  [+] Physical Dashboard:      {phys_dash_path}")
+    if net_0.top_combinations:
+        top_duos_0 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_0.top_combinations[:3]])
+        print(f"  [>] Team 1 Top Combinations: {top_duos_0}")
+    if net_1.top_combinations:
+        top_duos_1 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_1.top_combinations[:3]])
+        print(f"  [>] Team 2 Top Combinations: {top_duos_1}")
+    print("=" * 70 + "\n")
+
+
+def main(
+    source_video_path: str,
+    target_video_path: str,
+    device: str,
+    mode: Mode,
+    reports_dir: str = 'reports',
+    show_speed: bool = True
+) -> None:
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -589,7 +780,11 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             source_video_path=source_video_path, device=device)
     elif mode == Mode.PASS_DETECTION:
         frame_generator = run_pass_detection(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path,
+            device=device,
+            reports_dir=reports_dir,
+            show_speed=show_speed
+        )
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
@@ -607,15 +802,20 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='')
+    parser = argparse.ArgumentParser(description='Soccer AI Video Analysis')
     parser.add_argument('--source_video_path', type=str, required=True)
     parser.add_argument('--target_video_path', type=str, required=True)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--mode', type=Mode, default=Mode.PLAYER_DETECTION)
+    parser.add_argument('--reports_dir', type=str, default='reports')
+    parser.add_argument('--no-speed', dest='show_speed', action='store_false', help='Disable live speed badges on players')
+    parser.set_defaults(show_speed=True)
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        reports_dir=args.reports_dir,
+        show_speed=args.show_speed
     )

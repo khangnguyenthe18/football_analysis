@@ -1,6 +1,8 @@
 # Large data files (downloaded via setup.sh)
 examples/football/data/*.mp4
 examples/football/data/*.pt
+reports/
+test_output/
 
 # Colab cloned repos
 notebooks/football_analysis/

@@ -624,6 +624,15 @@ class PassDetector:
 
     # ----- Data Export Methods -----
 
+    @property
+    def events(self) -> List[PassEvent]:
+        """List of all recorded PassEvent instances."""
+        return list(self._events)
+
+    def get_events(self) -> List[PassEvent]:
+        """Get all recorded PassEvent instances."""
+        return list(self._events)
+
     def get_events_dataframe(self) -> pd.DataFrame:
         """
         Export all logged pass events as a Pandas DataFrame.
