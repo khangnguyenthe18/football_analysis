@@ -22,11 +22,8 @@ from sports.annotators.football import (
     draw_passing_network,
     draw_player_speed_badges,
     draw_physical_dashboard,
-    draw_offside_line_on_frame,
-    draw_offside_pitch_snapshot,
 )
 from sports.common.ball import BallTracker, BallAnnotator
-from sports.common.offside import OffsideDetector
 from sports.common.pass_detector import PassDetector, PassAnnotator
 from sports.common.physical import PlayerSpeedTracker
 from sports.common.tactical import HeatmapTracker, PassingNetworkAnalyzer
@@ -460,11 +457,6 @@ def run_pass_detection(
         pitch_width_m=CONFIG.width / 100.0
     )
     speed_tracker = PlayerSpeedTracker(fps=fps)
-    offside_detector = OffsideDetector(
-        pitch_length_m=CONFIG.length / 100.0,
-        pitch_width_m=CONFIG.width / 100.0,
-        display_duration_frames=int(fps * 1.6)
-    )
 
     pass_annotator = PassAnnotator(
         team_colors=(
@@ -532,7 +524,7 @@ def run_pass_detection(
         ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
         ball_detections = ball_tracker.update(ball_detections)
 
-        # --- Feed PassDetector, HeatmapTracker, PlayerSpeedTracker & OffsideDetector ---
+        # --- Feed PassDetector, HeatmapTracker & PlayerSpeedTracker ---
         if current_transformer is not None:
             # Transform player positions to pitch coordinates (cm → meters)
             all_field_players = sv.Detections.merge([players, goalkeepers])
@@ -556,39 +548,14 @@ def run_pass_detection(
                     ball_xy_pitch_cm = current_transformer.transform_points(ball_xy_pixel)
                     ball_xy_pitch_m = ball_xy_pitch_cm[0] / 100.0  # cm → meters
 
-                # Update team attack directions periodically
-                if frame_id % 30 == 0:
-                    offside_detector.infer_attack_directions(player_xy_pitch_m, all_field_team_ids)
-
                 # Update pass detection FSM
-                pass_event = pass_detector.update(
+                pass_detector.update(
                     frame_id=frame_id,
                     player_xy_pitch=player_xy_pitch_m,
                     player_tracker_ids=player_ids,
                     player_team_ids=all_field_team_ids,
                     ball_xy_pitch=ball_xy_pitch_m,
                 )
-
-                # Evaluate offside if a pass was resolved
-                if pass_event is not None:
-                    offside_dec = offside_detector.evaluate_pass(
-                        pass_event=pass_event,
-                        player_xy_pitch=player_xy_pitch_m,
-                        player_tracker_ids=player_ids,
-                        player_team_ids=all_field_team_ids,
-                        ball_xy_pitch=ball_xy_pitch_m,
-                    )
-                    if offside_dec is not None and offside_dec.is_offside:
-                        snap_img = draw_offside_pitch_snapshot(
-                            config=CONFIG,
-                            decision=offside_dec,
-                            player_xy_pitch=player_xy_pitch_m,
-                            player_ids=player_ids,
-                            player_teams=all_field_team_ids,
-                            team_colors=(sv.Color.from_hex(COLORS[0]), sv.Color.from_hex(COLORS[1])),
-                        )
-                        snap_path = os.path.join(reports_dir, f"offside_pass_{offside_dec.pass_id}.png")
-                        cv2.imwrite(snap_path, snap_img)
 
                 # Update trajectory tracker for heatmaps
                 heatmap_tracker.update(
@@ -608,7 +575,6 @@ def run_pass_detection(
         # --- Annotate frame ---
         annotated_frame = frame.copy()
 
-        # Player ellipses
         # Player ellipses & speed badges
         if len(all_detections) > 0:
             if show_speed and current_transformer is not None:
@@ -631,13 +597,6 @@ def run_pass_detection(
             annotated_frame = pass_annotator.annotate(
                 annotated_frame, pass_detector, current_transformer, frame_id)
 
-            # Active 3D Perspective Offside Laser Line & VAR Banner
-            active_offside = offside_detector.get_active_decision(frame_id)
-            if active_offside is not None:
-                annotated_frame = draw_offside_line_on_frame(
-                    annotated_frame, active_offside, current_transformer, CONFIG
-                )
-
         frame_id += 1
         yield annotated_frame
 
@@ -654,7 +613,7 @@ def run_pass_detection(
     else:
         print("\nNo pass events detected.")
 
-    # --- Generate and Export Tactical, Physical & VAR Analytics ---
+    # --- Generate and Export Tactical & Physical Analytics ---
     os.makedirs(reports_dir, exist_ok=True)
 
     # 1. 2D Positional Heatmaps
@@ -727,12 +686,6 @@ def run_pass_detection(
     )
     phys_dash_path = os.path.join(reports_dir, "physical_dashboard.png")
     cv2.imwrite(phys_dash_path, img_physical_dash)
-
-    # 4. Offside & SAOT VAR Decisions
-    df_offside = offside_detector.get_summary_dataframe()
-    offside_csv_path = os.path.join(reports_dir, "offside_summary.csv")
-    if not df_offside.empty:
-        df_offside.to_csv(offside_csv_path, index=False)
 
     print("\n" + "=" * 70)
     print("ANALYTICS & PHYSICAL PERFORMANCE REPORTS GENERATED")
