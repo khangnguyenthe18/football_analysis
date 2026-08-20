@@ -609,21 +609,22 @@ def run_pass_detection(
         annotated_frame = frame.copy()
 
         # Player ellipses
+        # Player ellipses & speed badges
         if len(all_detections) > 0:
-            annotated_frame = ELLIPSE_ANNOTATOR.annotate(
-                annotated_frame, all_detections, custom_color_lookup=color_lookup)
-
             if show_speed and current_transformer is not None:
-                # Live Speed Badges below feet with sprint highlights
+                # Live Speed & Distance Badges (Abdullah Tarek style: feet ring + solid ID box + 2 lines of metrics)
                 annotated_frame = draw_player_speed_badges(
                     annotated_frame, all_detections, speed_tracker,
                     custom_color_lookup=color_lookup, color_palette=COLORS
                 )
-            elif all_detections.tracker_id is not None:
-                labels = [str(tid) if (i < len(color_lookup) and color_lookup[i] in (0, 1)) else '' for i, tid in enumerate(all_detections.tracker_id)]
-                annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-                    annotated_frame, all_detections, labels,
-                    custom_color_lookup=color_lookup)
+            else:
+                annotated_frame = ELLIPSE_ANNOTATOR.annotate(
+                    annotated_frame, all_detections, custom_color_lookup=color_lookup)
+                if all_detections.tracker_id is not None:
+                    labels = [str(tid) if (i < len(color_lookup) and color_lookup[i] in (0, 1)) else '' for i, tid in enumerate(all_detections.tracker_id)]
+                    annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
+                        annotated_frame, all_detections, labels,
+                        custom_color_lookup=color_lookup)
 
         # Pass detection overlays (arrows, trail, HUD)
         if current_transformer is not None:

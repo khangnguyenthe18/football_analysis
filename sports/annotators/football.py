@@ -559,7 +559,11 @@ def draw_player_speed_badges(
     color_palette: Optional[List[str]] = None,
 ) -> np.ndarray:
     """
-    Renders live speed tags and sprint highlights below detected players.
+    Renders Abdullah Tarek style player visual badges:
+    - Ellipse / semi-circle ring at feet
+    - Solid Team ID rectangle with crisp black bold player ID
+    - Line 1: '{speed:.2f} km/h'
+    - Line 2: '{distance:.2f} m'
 
     Args:
         frame: The video frame to annotate.
@@ -575,14 +579,19 @@ def draw_player_speed_badges(
         return frame
 
     annotated = frame.copy()
-    palette = [sv.Color.from_hex(c).as_bgr() for c in (color_palette or ['#FF1493', '#00BFFF'])]
+
+    # Team colors: Team 0 = White (or light pink), Team 1 = Light green (or cyan)
+    palette = [
+        sv.Color.from_hex(color_palette[0]).as_bgr() if color_palette and len(color_palette) > 0 else (245, 245, 245),
+        sv.Color.from_hex(color_palette[1]).as_bgr() if color_palette and len(color_palette) > 1 else (160, 230, 160)
+    ]
 
     bottom_anchors = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
 
     for i, (tid, anchor) in enumerate(zip(detections.tracker_id, bottom_anchors)):
         team_idx = int(custom_color_lookup[i]) if custom_color_lookup is not None and i < len(custom_color_lookup) else 0
 
-        # 1. Bỏ qua hoàn toàn trọng tài (chỉ hiển thị tốc độ cho cầu thủ 2 đội)
+        # 1. Bỏ qua hoàn toàn trọng tài
         if team_idx not in (0, 1):
             continue
         if detections.class_id is not None and detections.class_id[i] == 2:  # REFEREE_CLASS_ID
@@ -590,30 +599,50 @@ def draw_player_speed_badges(
 
         tid = int(tid)
         speed = speed_tracker.get_player_speed_kmh(tid)
+        dist = speed_tracker.get_player_distance_m(tid)
 
-        # 2. Màu sắc cố định 100% theo đội (Hồng & Xanh), không bị đổi màu vàng/cam
         team_bgr = palette[team_idx % len(palette)]
         ax, ay = int(anchor[0]), int(anchor[1])
 
-        label = f"#{tid} {speed:.1f} km/h"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.42
-        thickness = 1
-        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        # A. Vòng bán nguyệt / ellipse dưới chân cầu thủ
+        ellipse_rx = 20
+        ellipse_ry = 9
+        cv2.ellipse(annotated, (ax, ay), (ellipse_rx, ellipse_ry), 0, -30, 210, team_bgr, 2, cv2.LINE_AA)
 
-        badge_w = tw + 12
-        badge_h = th + 8
+        # B. Khung ID hình chữ nhật viền đen, nền màu đội bóng
+        id_str = str(tid)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale_id = 0.52
+        thickness_id = 2
+        (id_w, id_h), _ = cv2.getTextSize(id_str, font, font_scale_id, thickness_id)
+
+        badge_w = max(34, id_w + 14)
+        badge_h = 22
         bx1 = ax - badge_w // 2
-        by1 = ay + 4
+        by1 = ay + 2
         bx2 = bx1 + badge_w
         by2 = by1 + badge_h
 
-        # Khung tốc độ nền tối mờ với viền màu đội bóng đồng nhất
-        overlay = annotated.copy()
-        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (18, 20, 26), -1)
-        cv2.addWeighted(overlay, 0.75, annotated, 0.25, 0, annotated)
-        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), team_bgr, 1, cv2.LINE_AA)
-        cv2.putText(annotated, label, (bx1 + 6, by2 - 4), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        # Khung chữ nhật màu đội
+        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), team_bgr, -1)
+        # Viền đen 1px
+        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (0, 0, 0), 1, cv2.LINE_AA)
+        # Số áo / ID màu đen in đậm
+        id_tx = ax - id_w // 2
+        id_ty = by1 + (badge_h + id_h) // 2 - 2
+        cv2.putText(annotated, id_str, (id_tx, id_ty), font, font_scale_id, (0, 0, 0), thickness_id, cv2.LINE_AA)
+
+        # C. Dòng 1: Vận tốc (VD: 6.73 km/h) - Chữ màu đen
+        speed_str = f"{speed:.2f} km/h"
+        font_scale_stats = 0.42
+        thickness_stats = 1
+        (sw, sh), _ = cv2.getTextSize(speed_str, font, font_scale_stats, thickness_stats)
+        cv2.putText(annotated, speed_str, (ax - sw // 2, by2 + 15), font, font_scale_stats, (0, 0, 0), thickness_stats, cv2.LINE_AA)
+
+        # D. Dòng 2: Quãng đường (VD: 19.44 m) - Chữ màu đen
+        dist_str = f"{dist:.2f} m"
+        (dw, dh), _ = cv2.getTextSize(dist_str, font, font_scale_stats, thickness_stats)
+        cv2.putText(annotated, dist_str, (ax - dw // 2, by2 + 29), font, font_scale_stats, (0, 0, 0), thickness_stats, cv2.LINE_AA)
 
     return annotated
 

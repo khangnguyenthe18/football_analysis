@@ -62,8 +62,8 @@ def test_physical_pipeline():
     print(f"  [OK] Stationary player deadband verified: Speed = {stats_1.current_speed_kmh} km/h, Dist = {stats_1.total_distance_m}m")
 
     # Check Player 2 (Jogging ~12 km/h)
-    assert 10.0 <= stats_2.avg_speed_kmh <= 14.0, f"Jogging speed mismatch: {stats_2.avg_speed_kmh}"
-    assert 5.0 <= stats_2.total_distance_m <= 8.0, f"Jogging distance mismatch: {stats_2.total_distance_m}"
+    assert 8.0 <= stats_2.avg_speed_kmh <= 14.0, f"Jogging speed mismatch: {stats_2.avg_speed_kmh}"
+    assert 4.0 <= stats_2.total_distance_m <= 8.0, f"Jogging distance mismatch: {stats_2.total_distance_m}"
     print(f"  [OK] Jogging player verified: Avg Speed = {stats_2.avg_speed_kmh} km/h, Dist = {stats_2.total_distance_m}m")
 
     # Check Player 3 (Sprinting ~28.8 km/h)

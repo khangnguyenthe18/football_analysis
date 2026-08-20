@@ -85,15 +85,15 @@ class PlayerSpeedTracker:
     def __init__(
         self,
         fps: float = 30.0,
-        window_size: int = 7,
-        deadband_speed_kmh: float = 0.8,
-        max_human_speed_kmh: float = 38.0,
+        window_size: int = 5,
+        deadband_speed_kmh: float = 0.5,
+        max_human_speed_kmh: float = 36.0,
         sprint_threshold_kmh: float = 25.2,
         min_sprint_frames: int = 5,
     ) -> None:
         self.fps = fps
         self.dt = 1.0 / max(fps, 1.0)
-        self.window_size = max(5, window_size)
+        self.frame_window = max(3, window_size)
         self.deadband_speed_kmh = deadband_speed_kmh
         self.max_human_speed_kmh = max_human_speed_kmh
         self.sprint_threshold_kmh = sprint_threshold_kmh
@@ -107,7 +107,8 @@ class PlayerSpeedTracker:
         self._max_speeds: Dict[int, float] = {}
         self._speed_histories: Dict[int, List[float]] = {}
         self._total_distances: Dict[int, float] = {}
-        self._last_positions: Dict[int, Tuple[float, float]] = {}
+        self._last_calc_frame: Dict[int, int] = {}
+        self._last_calc_pos: Dict[int, Tuple[float, float]] = {}
         self._active_frames: Dict[int, int] = {}
 
         # Sprint state machine
@@ -140,7 +141,8 @@ class PlayerSpeedTracker:
         player_team_ids: np.ndarray,
     ) -> None:
         """
-        Process current frame player positions and update speeds and distances.
+        Process current frame player positions and update speeds and distances
+        using the Abdullah Tarek 5-frame sliding window formulation.
 
         Args:
             frame_id: Current sequential frame number.
@@ -156,22 +158,24 @@ class PlayerSpeedTracker:
             tid = int(tid)
             raw_x, raw_y = float(pos[0]), float(pos[1])
 
-            # Apply Exponential Moving Average (EMA) to pitch coordinates to filter homography jitter
+            # Apply lightweight EMA on pitch coordinates to eliminate homography noise
             if pid in self._smoothed_pos:
                 prev_sx, prev_sy = self._smoothed_pos[pid]
-                sx = 0.3 * raw_x + 0.7 * prev_sx
-                sy = 0.3 * raw_y + 0.7 * prev_sy
+                sx = 0.35 * raw_x + 0.65 * prev_sx
+                sy = 0.35 * raw_y + 0.65 * prev_sy
             else:
                 sx, sy = raw_x, raw_y
             self._smoothed_pos[pid] = (sx, sy)
 
             # Initialize structures if first seen
             if pid not in self._positions:
-                self._positions[pid] = deque(maxlen=self.window_size)
+                self._positions[pid] = deque(maxlen=self.frame_window + 1)
                 self._current_speeds[pid] = 0.0
                 self._max_speeds[pid] = 0.0
                 self._speed_histories[pid] = []
                 self._total_distances[pid] = 0.0
+                self._last_calc_frame[pid] = frame_id
+                self._last_calc_pos[pid] = (sx, sy)
                 self._active_frames[pid] = 0
                 self._sprint_consecutive_frames[pid] = 0
                 self._sprint_in_progress[pid] = False
@@ -183,73 +187,65 @@ class PlayerSpeedTracker:
             self._active_frames[pid] += 1
             self._positions[pid].append((frame_id, sx, sy))
 
-            # Calculate smoothed speed using sliding window displacement
-            pos_history = list(self._positions[pid])
-            if len(pos_history) >= 2:
-                oldest_f, oldest_x, oldest_y = pos_history[0]
-                delta_frames = frame_id - oldest_f
+            # Calculate displacement and speed every frame_window frames (Abdullah Tarek approach)
+            delta_calc_frames = frame_id - self._last_calc_frame[pid]
+            if delta_calc_frames >= self.frame_window:
+                start_x, start_y = self._last_calc_pos[pid]
+                dx = sx - start_x
+                dy = sy - start_y
+                dist_covered = float(np.sqrt(dx * dx + dy * dy))
 
-                if delta_frames >= 2:
-                    dt_span = delta_frames * self.dt
-                    dx = sx - oldest_x
-                    dy = sy - oldest_y
-                    dist_span = float(np.sqrt(dx * dx + dy * dy))
-                    calc_speed_kmh = (dist_span / dt_span) * 3.6
+                # Time span in seconds
+                time_span_s = delta_calc_frames * self.dt
+                speed_ms = dist_covered / max(time_span_s, 1e-4)
+                speed_kmh = speed_ms * 3.6
 
-                    # Apply realistic speed ceiling (maximum 34 km/h for soccer sprint)
-                    calc_speed_kmh = min(calc_speed_kmh, 34.0)
-
-                    # Deadband filter for standing/micro-jitter
-                    if calc_speed_kmh < self.deadband_speed_kmh:
-                        calc_speed_kmh = 0.0
-
-                    # EMA filter on velocity to eliminate sudden frame spikes
-                    prev_speed = self._current_speeds.get(pid, 0.0)
-                    speed_kmh = 0.25 * calc_speed_kmh + 0.75 * prev_speed
+                # Apply realistic speed threshold and cap
+                if speed_kmh < self.deadband_speed_kmh or dist_covered < 0.08:
+                    speed_kmh = 0.0
                 else:
-                    speed_kmh = self._current_speeds.get(pid, 0.0)
-            else:
-                speed_kmh = 0.0
+                    speed_kmh = min(speed_kmh, self.max_human_speed_kmh)
 
-            # Store current and max speed
-            self._current_speeds[pid] = round(speed_kmh, 1)
-            self._speed_histories[pid].append(speed_kmh)
-            if speed_kmh > self._max_speeds[pid]:
-                self._max_speeds[pid] = round(speed_kmh, 1)
+                # Smooth speed transition
+                prev_speed = self._current_speeds.get(pid, 0.0)
+                smooth_speed = 0.5 * speed_kmh + 0.5 * prev_speed if prev_speed > 0 else speed_kmh
 
-            # Accumulate frame-to-frame distance
-            if pid in self._last_positions:
-                last_x, last_y = self._last_positions[pid]
-                step_dx = sx - last_x
-                step_dy = sy - last_y
-                step_dist = float(np.sqrt(step_dx * step_dx + step_dy * step_dy))
+                self._current_speeds[pid] = round(smooth_speed, 2)
+                if smooth_speed > self._max_speeds[pid]:
+                    self._max_speeds[pid] = round(smooth_speed, 2)
 
-                # Accumulate distance only if speed exceeds deadband and step is realistic (< 1.5m per frame)
-                if speed_kmh >= self.deadband_speed_kmh and step_dist < 1.5:
-                    self._total_distances[pid] += step_dist
-                    zone = self._classify_zone(speed_kmh)
-                    self._zone_distances[pid][zone] += step_dist
+                # Accumulate distance covered (reject unrealistic teleports > 15m in window)
+                if dist_covered < 15.0 and speed_kmh >= self.deadband_speed_kmh:
+                    self._total_distances[pid] += dist_covered
+                    zone = self._classify_zone(smooth_speed)
+                    self._zone_distances[pid][zone] += dist_covered
 
-            self._last_positions[pid] = (sx, sy)
+                self._last_calc_frame[pid] = frame_id
+                self._last_calc_pos[pid] = (sx, sy)
 
-            # Accumulate time in zone
-            zone = self._classify_zone(speed_kmh)
+            current_spd = self._current_speeds.get(pid, 0.0)
+            self._speed_histories[pid].append(current_spd)
+            zone = self._classify_zone(current_spd)
             self._zone_times[pid][zone] += self.dt
 
-            # Sprint detection FSM with hysteresis
-            if speed_kmh >= self.sprint_threshold_kmh:
+            # Sprint detection FSM
+            if current_spd >= self.sprint_threshold_kmh:
                 self._sprint_consecutive_frames[pid] += 1
                 if self._sprint_consecutive_frames[pid] >= self.min_sprint_frames and not self._sprint_in_progress[pid]:
                     self._sprint_in_progress[pid] = True
                     self._sprint_counts[pid] += 1
             else:
                 self._sprint_consecutive_frames[pid] = 0
-                if speed_kmh < (self.sprint_threshold_kmh - 3.0):  # Hysteresis reset threshold
+                if current_spd < (self.sprint_threshold_kmh - 3.0):
                     self._sprint_in_progress[pid] = False
 
     def get_player_speed_kmh(self, player_id: int) -> float:
-        """Get current instantaneous speed in km/h for a player."""
+        """Return instantaneous smoothed speed in km/h."""
         return self._current_speeds.get(player_id, 0.0)
+
+    def get_player_distance_m(self, player_id: int) -> float:
+        """Return total distance covered in meters."""
+        return self._total_distances.get(player_id, 0.0)
 
     def is_player_sprinting(self, player_id: int) -> bool:
         """Check if a player is currently in a sprint burst."""
