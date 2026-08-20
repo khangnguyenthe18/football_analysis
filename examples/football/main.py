@@ -601,160 +601,185 @@ def run_pass_detection(
         frame_id += 1
         yield annotated_frame
 
-    # --- Print summary after video ends ---
-    df = pass_detector.get_events_dataframe()
-    if not df.empty:
+    # --- Post-Processing: Generate Reports & Match Analysis Screen ---
+    # Wrap everything in try-except to ensure the match analysis screen
+    # is ALWAYS yielded at the end of the video, even if report generation fails.
+    import traceback as _tb
+
+    match_analysis_img = None
+    vid_w = video_info.width if video_info.width else 1920
+    vid_h = video_info.height if video_info.height else 1080
+
+    try:
+        # --- Print summary after video ends ---
+        df = pass_detector.get_events_dataframe()
+        if not df.empty:
+            print("\n" + "=" * 70)
+            print("PASS DETECTION & POSSESSION SUMMARY")
+            print("=" * 70)
+            print(df.to_string(index=False))
+            print(f"\nTeam 1 pass accuracy: {pass_detector.get_pass_accuracy(0):.1f}% | Possession: {pass_detector.get_possession_pct(0):.1f}%")
+            print(f"Team 2 pass accuracy: {pass_detector.get_pass_accuracy(1):.1f}% | Possession: {pass_detector.get_possession_pct(1):.1f}%")
+            print("=" * 70)
+        else:
+            print("\nNo pass events detected.")
+
+        # --- Generate and Export Tactical & Physical Analytics ---
+        os.makedirs(reports_dir, exist_ok=True)
+
+        # 1. 2D Positional Heatmaps
+        density_0 = heatmap_tracker.generate_density_grid(team_id=0)
+        density_1 = heatmap_tracker.generate_density_grid(team_id=1)
+
+        img_hm_0 = draw_pitch_heatmap(
+            config=CONFIG,
+            density_grid=density_0,
+            title="Team 1 - Positional Heatmap",
+            colormap=cv2.COLORMAP_JET
+        )
+        img_hm_1 = draw_pitch_heatmap(
+            config=CONFIG,
+            density_grid=density_1,
+            title="Team 2 - Positional Heatmap",
+            colormap=cv2.COLORMAP_HOT
+        )
+
+        hm0_path = os.path.join(reports_dir, "team_1_heatmap.png")
+        hm1_path = os.path.join(reports_dir, "team_2_heatmap.png")
+        cv2.imwrite(hm0_path, img_hm_0)
+        cv2.imwrite(hm1_path, img_hm_1)
+
+        # 2. Passing Networks
+        passing_analyzer = PassingNetworkAnalyzer()
+        passing_analyzer.update_events(pass_detector.events)
+        net_0 = passing_analyzer.compute_network(team_id=0, heatmap_tracker=heatmap_tracker, min_passes=1)
+        net_1 = passing_analyzer.compute_network(team_id=1, heatmap_tracker=heatmap_tracker, min_passes=1)
+
+        img_net_0 = draw_passing_network(
+            config=CONFIG,
+            player_positions=net_0.player_positions,
+            pass_connections=net_0.pass_connections,
+            player_involvements=net_0.player_involvements,
+            team_color=sv.Color.from_hex(COLORS[0]),
+            team_name="Team 1",
+            total_passes=net_0.total_completed_passes
+        )
+        img_net_1 = draw_passing_network(
+            config=CONFIG,
+            player_positions=net_1.player_positions,
+            pass_connections=net_1.pass_connections,
+            player_involvements=net_1.player_involvements,
+            team_color=sv.Color.from_hex(COLORS[1]),
+            team_name="Team 2",
+            total_passes=net_1.total_completed_passes
+        )
+
+        net0_path = os.path.join(reports_dir, "team_1_passing_network.png")
+        net1_path = os.path.join(reports_dir, "team_2_passing_network.png")
+        cv2.imwrite(net0_path, img_net_0)
+        cv2.imwrite(net1_path, img_net_1)
+
+        # 3. Physical Performance & Speed Analytics
+        df_physical = speed_tracker.get_summary_dataframe()
+        phys_csv_path = os.path.join(reports_dir, "physical_stats.csv")
+        if not df_physical.empty:
+            df_physical.to_csv(phys_csv_path, index=False)
+
+        team_0_phys = speed_tracker.get_team_stats(0)
+        team_1_phys = speed_tracker.get_team_stats(1)
+        img_physical_dash = draw_physical_dashboard(
+            team_0_stats=team_0_phys,
+            team_1_stats=team_1_phys,
+            team_0_color=sv.Color.from_hex(COLORS[0]),
+            team_1_color=sv.Color.from_hex(COLORS[1]),
+            team_0_name="Team 1",
+            team_1_name="Team 2",
+        )
+        phys_dash_path = os.path.join(reports_dir, "physical_dashboard.png")
+        cv2.imwrite(phys_dash_path, img_physical_dash)
+
+        # 4. Generate All-in-One Match Analysis Screen
+        t0_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 0)
+        t1_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 1)
+        t0_total_dist = sum(s.total_distance_m for s in team_0_phys)
+        t1_total_dist = sum(s.total_distance_m for s in team_1_phys)
+        t0_peak_spd = max([s.max_speed_kmh for s in team_0_phys] + [0.0])
+        t1_peak_spd = max([s.max_speed_kmh for s in team_1_phys] + [0.0])
+
+        t0_stats = {
+            'completed_passes': t0_completed_passes,
+            'pass_accuracy': pass_detector.get_pass_accuracy(0),
+            'possession_pct': pass_detector.get_possession_pct(0),
+            'total_distance_m': t0_total_dist,
+            'peak_speed_kmh': t0_peak_spd,
+        }
+        t1_stats = {
+            'completed_passes': t1_completed_passes,
+            'pass_accuracy': pass_detector.get_pass_accuracy(1),
+            'possession_pct': pass_detector.get_possession_pct(1),
+            'total_distance_m': t1_total_dist,
+            'peak_speed_kmh': t1_peak_spd,
+        }
+
+        match_analysis_img = draw_match_analysis_screen(
+            img_hm_0=img_hm_0,
+            img_hm_1=img_hm_1,
+            img_net_0=img_net_0,
+            img_net_1=img_net_1,
+            team_0_stats=t0_stats,
+            team_1_stats=t1_stats,
+            team_0_color=sv.Color.from_hex(COLORS[0]),
+            team_1_color=sv.Color.from_hex(COLORS[1]),
+            team_0_name="Team 1",
+            team_1_name="Team 2",
+            width=vid_w,
+            height=vid_h,
+        )
+        match_analysis_path = os.path.join(reports_dir, "match_analysis_summary.png")
+        cv2.imwrite(match_analysis_path, match_analysis_img)
+
         print("\n" + "=" * 70)
-        print("PASS DETECTION & POSSESSION SUMMARY")
+        print("ANALYTICS & PHYSICAL PERFORMANCE REPORTS GENERATED")
         print("=" * 70)
-        print(df.to_string(index=False))
-        print(f"\nTeam 1 pass accuracy: {pass_detector.get_pass_accuracy(0):.1f}% | Possession: {pass_detector.get_possession_pct(0):.1f}%")
-        print(f"Team 2 pass accuracy: {pass_detector.get_pass_accuracy(1):.1f}% | Possession: {pass_detector.get_possession_pct(1):.1f}%")
-        print("=" * 70)
-    else:
-        print("\nNo pass events detected.")
+        print(f"Reports saved to folder: '{os.path.abspath(reports_dir)}'")
+        print(f"  [+] Match Analysis Summary:  {match_analysis_path}")
+        print(f"  [+] Heatmap Team 1:          {hm0_path}")
+        print(f"  [+] Heatmap Team 2:          {hm1_path}")
+        print(f"  [+] Passing Network Team 1:  {net0_path}")
+        print(f"  [+] Passing Network Team 2:  {net1_path}")
+        print(f"  [+] Physical Stats CSV:      {phys_csv_path}")
+        print(f"  [+] Physical Dashboard:      {phys_dash_path}")
+        if net_0.top_combinations:
+            top_duos_0 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_0.top_combinations[:3]])
+            print(f"  [>] Team 1 Top Combinations: {top_duos_0}")
+        if net_1.top_combinations:
+            top_duos_1 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_1.top_combinations[:3]])
+            print(f"  [>] Team 2 Top Combinations: {top_duos_1}")
+        print("=" * 70 + "\n")
 
-    # --- Generate and Export Tactical & Physical Analytics ---
-    os.makedirs(reports_dir, exist_ok=True)
+    except Exception as exc:
+        print("\n" + "!" * 70)
+        print(f"[ERROR] Report generation failed: {exc}")
+        _tb.print_exc()
+        print("!" * 70 + "\n")
 
-    # 1. 2D Positional Heatmaps
-    density_0 = heatmap_tracker.generate_density_grid(team_id=0)
-    density_1 = heatmap_tracker.generate_density_grid(team_id=1)
+    # 5. ALWAYS append Match Analysis Screen to video (even if reports failed)
+    if match_analysis_img is None:
+        # Fallback: create simple text-only summary screen
+        print("[WARN] Creating fallback match analysis screen...")
+        match_analysis_img = np.zeros((vid_h, vid_w, 3), dtype=np.uint8)
+        match_analysis_img[:] = (18, 22, 28)
+        cv2.putText(match_analysis_img, "MATCH ANALYSIS", (vid_w // 2 - 200, vid_h // 2 - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(match_analysis_img, "Report generation encountered an error",
+                    (vid_w // 2 - 280, vid_h // 2 + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
-    img_hm_0 = draw_pitch_heatmap(
-        config=CONFIG,
-        density_grid=density_0,
-        title="Team 1 - Positional Heatmap",
-        colormap=cv2.COLORMAP_JET
-    )
-    img_hm_1 = draw_pitch_heatmap(
-        config=CONFIG,
-        density_grid=density_1,
-        title="Team 2 - Positional Heatmap",
-        colormap=cv2.COLORMAP_HOT
-    )
-
-    hm0_path = os.path.join(reports_dir, "team_1_heatmap.png")
-    hm1_path = os.path.join(reports_dir, "team_2_heatmap.png")
-    cv2.imwrite(hm0_path, img_hm_0)
-    cv2.imwrite(hm1_path, img_hm_1)
-
-    # 2. Passing Networks
-    passing_analyzer = PassingNetworkAnalyzer()
-    passing_analyzer.update_events(pass_detector.events)
-    net_0 = passing_analyzer.compute_network(team_id=0, heatmap_tracker=heatmap_tracker, min_passes=1)
-    net_1 = passing_analyzer.compute_network(team_id=1, heatmap_tracker=heatmap_tracker, min_passes=1)
-
-    img_net_0 = draw_passing_network(
-        config=CONFIG,
-        player_positions=net_0.player_positions,
-        pass_connections=net_0.pass_connections,
-        player_involvements=net_0.player_involvements,
-        team_color=sv.Color.from_hex(COLORS[0]),
-        team_name="Team 1",
-        total_passes=net_0.total_completed_passes
-    )
-    img_net_1 = draw_passing_network(
-        config=CONFIG,
-        player_positions=net_1.player_positions,
-        pass_connections=net_1.pass_connections,
-        player_involvements=net_1.player_involvements,
-        team_color=sv.Color.from_hex(COLORS[1]),
-        team_name="Team 2",
-        total_passes=net_1.total_completed_passes
-    )
-
-    net0_path = os.path.join(reports_dir, "team_1_passing_network.png")
-    net1_path = os.path.join(reports_dir, "team_2_passing_network.png")
-    cv2.imwrite(net0_path, img_net_0)
-    cv2.imwrite(net1_path, img_net_1)
-
-    # 3. Physical Performance & Speed Analytics
-    df_physical = speed_tracker.get_summary_dataframe()
-    phys_csv_path = os.path.join(reports_dir, "physical_stats.csv")
-    if not df_physical.empty:
-        df_physical.to_csv(phys_csv_path, index=False)
-
-    team_0_phys = speed_tracker.get_team_stats(0)
-    team_1_phys = speed_tracker.get_team_stats(1)
-    img_physical_dash = draw_physical_dashboard(
-        team_0_stats=team_0_phys,
-        team_1_stats=team_1_phys,
-        team_0_color=sv.Color.from_hex(COLORS[0]),
-        team_1_color=sv.Color.from_hex(COLORS[1]),
-        team_0_name="Team 1",
-        team_1_name="Team 2",
-    )
-    phys_dash_path = os.path.join(reports_dir, "physical_dashboard.png")
-    cv2.imwrite(phys_dash_path, img_physical_dash)
-
-    # 4. Generate All-in-One Match Analysis Screen
-    t0_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 0)
-    t1_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 1)
-    t0_total_dist = sum(s.total_distance_m for s in team_0_phys)
-    t1_total_dist = sum(s.total_distance_m for s in team_1_phys)
-    t0_peak_spd = max([s.max_speed_kmh for s in team_0_phys] + [0.0])
-    t1_peak_spd = max([s.max_speed_kmh for s in team_1_phys] + [0.0])
-
-    t0_stats = {
-        'completed_passes': t0_completed_passes,
-        'pass_accuracy': pass_detector.get_pass_accuracy(0),
-        'possession_pct': pass_detector.get_possession_pct(0),
-        'total_distance_m': t0_total_dist,
-        'peak_speed_kmh': t0_peak_spd,
-    }
-    t1_stats = {
-        'completed_passes': t1_completed_passes,
-        'pass_accuracy': pass_detector.get_pass_accuracy(1),
-        'possession_pct': pass_detector.get_possession_pct(1),
-        'total_distance_m': t1_total_dist,
-        'peak_speed_kmh': t1_peak_spd,
-    }
-
-    vid_w = video_info.width if video_info.width else 1280
-    vid_h = video_info.height if video_info.height else 720
-
-    match_analysis_img = draw_match_analysis_screen(
-        img_hm_0=img_hm_0,
-        img_hm_1=img_hm_1,
-        img_net_0=img_net_0,
-        img_net_1=img_net_1,
-        team_0_stats=t0_stats,
-        team_1_stats=t1_stats,
-        team_0_color=sv.Color.from_hex(COLORS[0]),
-        team_1_color=sv.Color.from_hex(COLORS[1]),
-        team_0_name="Team 1",
-        team_1_name="Team 2",
-        width=vid_w,
-        height=vid_h,
-    )
-    match_analysis_path = os.path.join(reports_dir, "match_analysis_summary.png")
-    cv2.imwrite(match_analysis_path, match_analysis_img)
-
-    print("\n" + "=" * 70)
-    print("ANALYTICS & PHYSICAL PERFORMANCE REPORTS GENERATED")
-    print("=" * 70)
-    print(f"Reports saved to folder: '{os.path.abspath(reports_dir)}'")
-    print(f"  [+] Match Analysis Summary:  {match_analysis_path}")
-    print(f"  [+] Heatmap Team 1:          {hm0_path}")
-    print(f"  [+] Heatmap Team 2:          {hm1_path}")
-    print(f"  [+] Passing Network Team 1:  {net0_path}")
-    print(f"  [+] Passing Network Team 2:  {net1_path}")
-    print(f"  [+] Physical Stats CSV:      {phys_csv_path}")
-    print(f"  [+] Physical Dashboard:      {phys_dash_path}")
-    if net_0.top_combinations:
-        top_duos_0 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_0.top_combinations[:3]])
-        print(f"  [>] Team 1 Top Combinations: {top_duos_0}")
-    if net_1.top_combinations:
-        top_duos_1 = ", ".join([f"#{p1} <-> #{p2} ({cnt} passes)" for p1, p2, cnt in net_1.top_combinations[:3]])
-        print(f"  [>] Team 2 Top Combinations: {top_duos_1}")
-    print("=" * 70 + "\n")
-
-    # 5. Append Match Analysis Screen to Video for 8 seconds (e.g. ~200 frames)
     summary_frames_count = int(fps * 8.0)
     print(f"\n[+] Appending Match Analysis Summary Screen ({summary_frames_count} frames ~ {summary_frames_count/fps:.1f}s) to end of video...")
     for _ in range(summary_frames_count):
         yield match_analysis_img
+    print(f"[+] Match Analysis Screen appended successfully!")
 
 
 def main(
