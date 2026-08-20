@@ -699,8 +699,8 @@ def run_pass_detection(
         cv2.imwrite(phys_dash_path, img_physical_dash)
 
         # 4. Generate All-in-One Match Analysis Screen
-        t0_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 0)
-        t1_completed_passes = sum(1 for e in pass_detector.events if e.is_successful and e.team_id == 1)
+        t0_completed_passes = sum(1 for e in pass_detector.events if e.event_type == "completed" and e.passer_team == 0)
+        t1_completed_passes = sum(1 for e in pass_detector.events if e.event_type == "completed" and e.passer_team == 1)
         t0_total_dist = sum(s.total_distance_m for s in team_0_phys)
         t1_total_dist = sum(s.total_distance_m for s in team_1_phys)
         t0_peak_spd = max([s.max_speed_kmh for s in team_0_phys] + [0.0])
