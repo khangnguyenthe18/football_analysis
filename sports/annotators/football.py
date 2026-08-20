@@ -580,10 +580,10 @@ def draw_player_speed_badges(
 
     annotated = frame.copy()
 
-    # Team colors: Team 0 = White (or light pink), Team 1 = Light green (or cyan)
+    # Màu cố định cho 2 đội: Đội 1 = Hồng (#FF1493), Đội 2 = Xanh (#00BFFF)
     palette = [
-        sv.Color.from_hex(color_palette[0]).as_bgr() if color_palette and len(color_palette) > 0 else (245, 245, 245),
-        sv.Color.from_hex(color_palette[1]).as_bgr() if color_palette and len(color_palette) > 1 else (160, 230, 160)
+        sv.Color.from_hex(color_palette[0]).as_bgr() if color_palette and len(color_palette) > 0 else sv.Color.from_hex('#FF1493').as_bgr(),
+        sv.Color.from_hex(color_palette[1]).as_bgr() if color_palette and len(color_palette) > 1 else sv.Color.from_hex('#00BFFF').as_bgr()
     ]
 
     bottom_anchors = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
