@@ -750,8 +750,9 @@ def run_pass_detection(
         print(f"  [>] Team 2 Top Combinations: {top_duos_1}")
     print("=" * 70 + "\n")
 
-    # 5. Append Match Analysis Screen to Video for 8 seconds (e.g. ~240 frames)
+    # 5. Append Match Analysis Screen to Video for 8 seconds (e.g. ~200 frames)
     summary_frames_count = int(fps * 8.0)
+    print(f"\n[+] Appending Match Analysis Summary Screen ({summary_frames_count} frames ~ {summary_frames_count/fps:.1f}s) to end of video...")
     for _ in range(summary_frames_count):
         yield match_analysis_img
 
@@ -793,6 +794,17 @@ def main(
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
     video_info = sv.VideoInfo.from_video_path(source_video_path)
+    if mode == Mode.PASS_DETECTION:
+        # Extend total_frames in VideoInfo to account for 8s Match Analysis summary
+        summary_frames = int(video_info.fps * 8.0)
+        tot = (video_info.total_frames + summary_frames) if video_info.total_frames else None
+        video_info = sv.VideoInfo(
+            width=video_info.width,
+            height=video_info.height,
+            fps=video_info.fps,
+            total_frames=tot
+        )
+
     with sv.VideoSink(target_video_path, video_info) as sink:
         for frame in frame_generator:
             sink.write_frame(frame)
