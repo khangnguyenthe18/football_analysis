@@ -116,15 +116,20 @@ class VoronoiMinimap:
         config: SoccerPitchConfiguration,
         minimap_width: int = 360,
         padding: int = 14,
-        alpha: float = 0.30,
+        alpha: float = 0.50,
         player_radius: int = 10,
         ball_radius: int = 5,
+        ema_alpha: float = 0.35,
     ):
         self.config = config
         self.padding = padding
         self.alpha = alpha
         self.player_radius = player_radius
         self.ball_radius = ball_radius
+
+        # EMA smoothing for position stability
+        self._ema_alpha = ema_alpha   # weight for new data (lower = smoother)
+        self._smoothed: Dict[int, np.ndarray] = {}  # tracker_id → smoothed (x,y) cm
 
         # Compute scale: map pitch cm → minimap pixels
         usable_w = minimap_width - 2 * padding
@@ -183,6 +188,35 @@ class VoronoiMinimap:
         """Convert pitch coordinates (cm) to minimap pixel coordinates."""
         return (xy_cm * self.scale + self.padding).astype(np.float32)
 
+    def _smooth_positions(
+        self, xy_cm: np.ndarray, jersey_ids: np.ndarray
+    ) -> np.ndarray:
+        """
+        Apply Exponential Moving Average (EMA) smoothing to player positions.
+
+        Reduces frame-to-frame jitter caused by homography noise, producing
+        stable Voronoi regions across consecutive frames.
+        """
+        smoothed = np.copy(xy_cm)
+        a = self._ema_alpha
+        for i in range(len(jersey_ids)):
+            tid = int(jersey_ids[i])
+            if tid in self._smoothed:
+                smoothed[i] = a * xy_cm[i] + (1.0 - a) * self._smoothed[tid]
+            self._smoothed[tid] = smoothed[i].copy()
+
+        # Prune tracker IDs no longer present
+        current_ids = set(int(j) for j in jersey_ids)
+        self._smoothed = {k: v for k, v in self._smoothed.items() if k in current_ids}
+        return smoothed
+
+    @staticmethod
+    def _brighten_color(
+        color: Tuple[int, int, int], factor: float = 1.4
+    ) -> Tuple[int, int, int]:
+        """Make a BGR color brighter for Voronoi region fill."""
+        return tuple(min(255, int(c * factor)) for c in color)
+
     def render(
         self,
         player_xy_pitch_cm: np.ndarray,
@@ -207,16 +241,19 @@ class VoronoiMinimap:
         # Start from cached pitch base
         minimap = self._base_pitch.copy()
 
-        if len(player_xy_pitch_cm) < 2 or Voronoi is None:
+        # Apply EMA smoothing for stability
+        smoothed_cm = self._smooth_positions(player_xy_pitch_cm, player_jersey_ids)
+
+        if len(smoothed_cm) < 2 or Voronoi is None:
             # Not enough players for Voronoi or scipy not available
-            self._draw_players(minimap, player_xy_pitch_cm, player_team_ids,
+            self._draw_players(minimap, smoothed_cm, player_team_ids,
                                player_jersey_ids, team_colors)
             if ball_xy_pitch_cm is not None:
                 self._draw_ball(minimap, ball_xy_pitch_cm)
             return minimap
 
-        # Convert player positions to minimap pixel coords
-        player_px = self._pitch_cm_to_minimap_px(player_xy_pitch_cm)
+        # Convert smoothed positions to minimap pixel coords
+        player_px = self._pitch_cm_to_minimap_px(smoothed_cm)
 
         # --- Voronoi computation ---
         # Add dummy far-away points to ensure all regions are bounded
@@ -260,16 +297,17 @@ class VoronoiMinimap:
                 continue
 
             team_id = int(player_team_ids[i])
-            color = team_colors.get(team_id, (128, 128, 128))
+            base_color = team_colors.get(team_id, (128, 128, 128))
+            fill_color = self._brighten_color(base_color, factor=1.4)
 
             pts = clipped.astype(np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(overlay, [pts], color)
+            cv2.fillPoly(overlay, [pts], fill_color)
 
         # Blend Voronoi overlay with pitch
         cv2.addWeighted(overlay, self.alpha, minimap, 1.0 - self.alpha, 0, minimap)
 
         # --- Draw Voronoi edges ---
-        edge_color = (200, 200, 200)
+        edge_color = (255, 255, 255)
         for ridge_idx, (p1_idx, p2_idx) in enumerate(vor.ridge_points):
             # Only draw edges between real players (not dummy points)
             if p1_idx >= n_players or p2_idx >= n_players:
@@ -285,7 +323,7 @@ class VoronoiMinimap:
             # Clip to minimap bounds
             if (0 <= v1[0] < self.minimap_w and 0 <= v1[1] < self.minimap_h and
                     0 <= v2[0] < self.minimap_w and 0 <= v2[1] < self.minimap_h):
-                cv2.line(minimap, tuple(v1), tuple(v2), edge_color, 1, cv2.LINE_AA)
+                cv2.line(minimap, tuple(v1), tuple(v2), edge_color, 2, cv2.LINE_AA)
 
         # --- Re-draw pitch lines on top of Voronoi (so lines stay crisp) ---
         pitch_lines = self._base_pitch.copy()
@@ -294,7 +332,7 @@ class VoronoiMinimap:
         minimap[line_mask > 0] = pitch_lines[line_mask > 0]
 
         # --- Draw players and ball ---
-        self._draw_players(minimap, player_xy_pitch_cm, player_team_ids,
+        self._draw_players(minimap, smoothed_cm, player_team_ids,
                            player_jersey_ids, team_colors)
         if ball_xy_pitch_cm is not None:
             self._draw_ball(minimap, ball_xy_pitch_cm)
