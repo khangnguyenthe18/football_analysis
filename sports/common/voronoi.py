@@ -119,7 +119,9 @@ class VoronoiMinimap:
         alpha: float = 0.75,
         player_radius: int = 8,
         ball_radius: int = 4,
-        ema_alpha: float = 0.35,
+        ema_alpha: float = 0.18,
+        ghost_ttl: int = 5,
+        frame_blend: float = 0.40,
     ):
         self.config = config
         self.padding = padding
@@ -130,6 +132,18 @@ class VoronoiMinimap:
         # EMA smoothing for position stability
         self._ema_alpha = ema_alpha   # weight for new data (lower = smoother)
         self._smoothed: Dict[int, np.ndarray] = {}  # tracker_id → smoothed (x,y) cm
+        self._smoothed_team: Dict[int, int] = {}     # tracker_id → team_id
+
+        # Ghost persistence: keep players visible for ghost_ttl frames after disappearing
+        self._ghost_ttl = ghost_ttl
+        self._ghost_age: Dict[int, int] = {}  # tracker_id → frames since last seen
+
+        # Temporal frame blending: blend previous minimap with current
+        self._frame_blend = frame_blend  # weight for previous frame (0 = no blend)
+        self._prev_minimap: Optional[np.ndarray] = None
+
+        # Ball position smoothing
+        self._smoothed_ball: Optional[np.ndarray] = None
 
         # Compute scale: map pitch cm → minimap pixels
         usable_w = minimap_width - 2 * padding
@@ -189,25 +203,75 @@ class VoronoiMinimap:
         return (xy_cm * self.scale + self.padding).astype(np.float32)
 
     def _smooth_positions(
-        self, xy_cm: np.ndarray, jersey_ids: np.ndarray
-    ) -> np.ndarray:
+        self, xy_cm: np.ndarray, jersey_ids: np.ndarray,
+        team_ids: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Apply Exponential Moving Average (EMA) smoothing to player positions.
+        Apply EMA smoothing + ghost persistence to player positions.
 
-        Reduces frame-to-frame jitter caused by homography noise, producing
-        stable Voronoi regions across consecutive frames.
+        Returns smoothed positions including ghost players (recently
+        disappeared players kept for ghost_ttl frames).
+
+        Returns:
+            (smoothed_xy, all_jersey_ids, all_team_ids) — may be larger than
+            input if ghost players are added.
         """
         smoothed = np.copy(xy_cm)
         a = self._ema_alpha
+
+        current_ids = set()
         for i in range(len(jersey_ids)):
             tid = int(jersey_ids[i])
+            current_ids.add(tid)
             if tid in self._smoothed:
                 smoothed[i] = a * xy_cm[i] + (1.0 - a) * self._smoothed[tid]
             self._smoothed[tid] = smoothed[i].copy()
+            self._smoothed_team[tid] = int(team_ids[i])
+            self._ghost_age[tid] = 0  # reset age — player is visible
 
-        # Prune tracker IDs no longer present
-        current_ids = set(int(j) for j in jersey_ids)
-        self._smoothed = {k: v for k, v in self._smoothed.items() if k in current_ids}
+        # Collect ghost players (recently lost)
+        ghost_xy = []
+        ghost_jersey = []
+        ghost_team = []
+        expired = []
+        for tid, pos in self._smoothed.items():
+            if tid not in current_ids:
+                age = self._ghost_age.get(tid, 0) + 1
+                self._ghost_age[tid] = age
+                if age <= self._ghost_ttl:
+                    ghost_xy.append(pos)
+                    ghost_jersey.append(tid)
+                    ghost_team.append(self._smoothed_team.get(tid, 0))
+                else:
+                    expired.append(tid)
+
+        # Prune fully expired ghosts
+        for tid in expired:
+            self._smoothed.pop(tid, None)
+            self._smoothed_team.pop(tid, None)
+            self._ghost_age.pop(tid, None)
+
+        # Merge current + ghosts
+        if ghost_xy:
+            all_xy = np.vstack([smoothed, np.array(ghost_xy)])
+            all_jersey = np.concatenate([jersey_ids, np.array(ghost_jersey)])
+            all_team = np.concatenate([team_ids, np.array(ghost_team)])
+        else:
+            all_xy = smoothed
+            all_jersey = jersey_ids
+            all_team = team_ids
+
+        return all_xy, all_jersey, all_team
+
+    def _smooth_ball(self, ball_cm: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Apply EMA smoothing to ball position."""
+        if ball_cm is None:
+            return self._smoothed_ball  # use last known position
+        if self._smoothed_ball is not None:
+            smoothed = 0.3 * ball_cm + 0.7 * self._smoothed_ball
+        else:
+            smoothed = ball_cm.copy()
+        self._smoothed_ball = smoothed
         return smoothed
 
     @staticmethod
@@ -241,15 +305,20 @@ class VoronoiMinimap:
         # Start from cached pitch base
         minimap = self._base_pitch.copy()
 
-        # Apply EMA smoothing for stability
-        smoothed_cm = self._smooth_positions(player_xy_pitch_cm, player_jersey_ids)
+        # Apply EMA smoothing + ghost persistence for stability
+        smoothed_cm, all_jersey_ids, all_team_ids = self._smooth_positions(
+            player_xy_pitch_cm, player_jersey_ids, player_team_ids
+        )
+
+        # Smooth ball position
+        smooth_ball = self._smooth_ball(ball_xy_pitch_cm)
 
         if len(smoothed_cm) < 2 or Voronoi is None:
             # Not enough players for Voronoi or scipy not available
-            self._draw_players(minimap, smoothed_cm, player_team_ids,
-                               player_jersey_ids, team_colors)
-            if ball_xy_pitch_cm is not None:
-                self._draw_ball(minimap, ball_xy_pitch_cm)
+            self._draw_players(minimap, smoothed_cm, all_team_ids,
+                               all_jersey_ids, team_colors)
+            if smooth_ball is not None:
+                self._draw_ball(minimap, smooth_ball)
             return minimap
 
         # Convert smoothed positions to minimap pixel coords
@@ -267,10 +336,10 @@ class VoronoiMinimap:
             vor = Voronoi(all_points)
         except Exception:
             # Fallback: skip Voronoi if computation fails
-            self._draw_players(minimap, player_xy_pitch_cm, player_team_ids,
-                               player_jersey_ids, team_colors)
-            if ball_xy_pitch_cm is not None:
-                self._draw_ball(minimap, ball_xy_pitch_cm)
+            self._draw_players(minimap, smoothed_cm, all_team_ids,
+                               all_jersey_ids, team_colors)
+            if smooth_ball is not None:
+                self._draw_ball(minimap, smooth_ball)
             return minimap
 
         # --- Draw Voronoi regions ---
@@ -296,7 +365,7 @@ class VoronoiMinimap:
             if len(clipped) < 3:
                 continue
 
-            team_id = int(player_team_ids[i])
+            team_id = int(all_team_ids[i])
             base_color = team_colors.get(team_id, (128, 128, 128))
 
             # Create a muted but visible version for the region fill
@@ -334,10 +403,18 @@ class VoronoiMinimap:
         minimap[line_mask > 0] = (200, 200, 200)  # draw lines slightly brighter on top of voronoi
 
         # --- Draw players and ball ---
-        self._draw_players(minimap, smoothed_cm, player_team_ids,
-                           player_jersey_ids, team_colors)
-        if ball_xy_pitch_cm is not None:
-            self._draw_ball(minimap, ball_xy_pitch_cm)
+        self._draw_players(minimap, smoothed_cm, all_team_ids,
+                           all_jersey_ids, team_colors)
+        if smooth_ball is not None:
+            self._draw_ball(minimap, smooth_ball)
+
+        # --- Temporal frame blending for smooth transitions ---
+        if self._prev_minimap is not None and self._frame_blend > 0:
+            fb = self._frame_blend
+            minimap = cv2.addWeighted(
+                self._prev_minimap, fb, minimap, 1.0 - fb, 0
+            )
+        self._prev_minimap = minimap.copy()
 
         return minimap
 
