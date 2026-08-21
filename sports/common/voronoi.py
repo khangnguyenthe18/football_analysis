@@ -321,6 +321,20 @@ class VoronoiMinimap:
         Returns:
             Minimap image as np.ndarray (H x W x 3).
         """
+        # --- Filter out players outside pitch boundaries ---
+        # Remove substitutes / sideline players (with 3m margin tolerance)
+        margin_cm = 300.0
+        if len(player_xy_pitch_cm) > 0:
+            in_bounds = (
+                (player_xy_pitch_cm[:, 0] >= -margin_cm) &
+                (player_xy_pitch_cm[:, 0] <= self._pitch_x_max_cm + margin_cm) &
+                (player_xy_pitch_cm[:, 1] >= -margin_cm) &
+                (player_xy_pitch_cm[:, 1] <= self._pitch_y_max_cm + margin_cm)
+            )
+            player_xy_pitch_cm = player_xy_pitch_cm[in_bounds]
+            player_team_ids = player_team_ids[in_bounds]
+            player_jersey_ids = player_jersey_ids[in_bounds]
+
         # Start from cached pitch base
         minimap = self._base_pitch.copy()
 
