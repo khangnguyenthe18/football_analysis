@@ -57,12 +57,12 @@ def _clip_polygon_to_rect(
 
     pts = polygon.tolist()
 
-    # Clip against each edge of the rectangle: left, right, bottom, top
+    # Clip against each edge of the rectangle (counter-clockwise winding)
     edges = [
-        ((x_min, y_min), (x_min, y_max)),  # left
-        ((x_max, y_max), (x_max, y_min)),  # right
-        ((x_min, y_max), (x_max, y_max)),  # bottom
-        ((x_max, y_min), (x_min, y_min)),  # top
+        ((x_min, y_max), (x_min, y_min)),  # left   (keep points with x >= x_min)
+        ((x_max, y_min), (x_max, y_max)),  # right  (keep points with x <= x_max)
+        ((x_min, y_min), (x_max, y_min)),  # top    (keep points with y >= y_min)
+        ((x_max, y_max), (x_min, y_max)),  # bottom (keep points with y <= y_max)
     ]
     for e_start, e_end in edges:
         pts = clip_edge(pts, e_start, e_end)
@@ -116,9 +116,9 @@ class VoronoiMinimap:
         config: SoccerPitchConfiguration,
         minimap_width: int = 360,
         padding: int = 14,
-        alpha: float = 0.50,
-        player_radius: int = 10,
-        ball_radius: int = 5,
+        alpha: float = 0.75,
+        player_radius: int = 8,
+        ball_radius: int = 4,
         ema_alpha: float = 0.35,
     ):
         self.config = config
@@ -147,10 +147,10 @@ class VoronoiMinimap:
         self._base_pitch = self._draw_pitch_base()
 
     def _draw_pitch_base(self) -> np.ndarray:
-        """Draw the static pitch lines on a green background."""
-        bg_color = (34, 139, 34)  # BGR green
-        line_color = (255, 255, 255)
-        line_thick = 2
+        """Draw the static pitch lines on a dark background."""
+        bg_color = (30, 30, 30)  # BGR dark/near-black
+        line_color = (140, 140, 140)  # dim gray lines
+        line_thick = 1
 
         img = np.ones((self.minimap_h, self.minimap_w, 3), dtype=np.uint8)
         img[:] = bg_color
@@ -173,14 +173,14 @@ class VoronoiMinimap:
         cv2.circle(img, center, radius, line_color, line_thick)
 
         # Centre spot
-        cv2.circle(img, center, 3, line_color, -1)
+        cv2.circle(img, center, 2, line_color, -1)
 
         # Penalty spots
         ps_dist = cfg.penalty_spot_distance
         ps1 = (int(ps_dist * s) + p, int(cfg.width / 2 * s) + p)
         ps2 = (int((cfg.length - ps_dist) * s) + p, int(cfg.width / 2 * s) + p)
-        cv2.circle(img, ps1, 3, line_color, -1)
-        cv2.circle(img, ps2, 3, line_color, -1)
+        cv2.circle(img, ps1, 2, line_color, -1)
+        cv2.circle(img, ps2, 2, line_color, -1)
 
         return img
 
@@ -274,7 +274,7 @@ class VoronoiMinimap:
             return minimap
 
         # --- Draw Voronoi regions ---
-        overlay = minimap.copy()
+        # Paint team-colored regions directly onto the pitch area
         n_players = len(player_px)
 
         for i in range(n_players):
@@ -298,16 +298,18 @@ class VoronoiMinimap:
 
             team_id = int(player_team_ids[i])
             base_color = team_colors.get(team_id, (128, 128, 128))
-            fill_color = self._brighten_color(base_color, factor=1.4)
+
+            # Create a muted but visible version for the region fill
+            # Blend team color with dark background for a rich look
+            fill_color = tuple(
+                int(c * 0.55 + 25) for c in base_color
+            )
 
             pts = clipped.astype(np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(overlay, [pts], fill_color)
-
-        # Blend Voronoi overlay with pitch
-        cv2.addWeighted(overlay, self.alpha, minimap, 1.0 - self.alpha, 0, minimap)
+            cv2.fillPoly(minimap, [pts], fill_color)
 
         # --- Draw Voronoi edges ---
-        edge_color = (255, 255, 255)
+        edge_color = (15, 15, 15)  # dark/black edges
         for ridge_idx, (p1_idx, p2_idx) in enumerate(vor.ridge_points):
             # Only draw edges between real players (not dummy points)
             if p1_idx >= n_players or p2_idx >= n_players:
@@ -327,9 +329,9 @@ class VoronoiMinimap:
 
         # --- Re-draw pitch lines on top of Voronoi (so lines stay crisp) ---
         pitch_lines = self._base_pitch.copy()
-        # Create mask of white lines
-        line_mask = cv2.inRange(pitch_lines, (250, 250, 250), (255, 255, 255))
-        minimap[line_mask > 0] = pitch_lines[line_mask > 0]
+        # Create mask of pitch lines (gray lines on dark background)
+        line_mask = cv2.inRange(pitch_lines, (130, 130, 130), (255, 255, 255))
+        minimap[line_mask > 0] = (200, 200, 200)  # draw lines slightly brighter on top of voronoi
 
         # --- Draw players and ball ---
         self._draw_players(minimap, smoothed_cm, player_team_ids,
