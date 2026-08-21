@@ -119,9 +119,10 @@ class VoronoiMinimap:
         alpha: float = 0.75,
         player_radius: int = 8,
         ball_radius: int = 4,
-        ema_alpha: float = 0.18,
-        ghost_ttl: int = 5,
-        frame_blend: float = 0.40,
+        ema_alpha: float = 0.12,
+        ghost_ttl: int = 8,
+        frame_blend: float = 0.55,
+        jump_threshold_cm: float = 1500.0,
     ):
         self.config = config
         self.padding = padding
@@ -144,6 +145,13 @@ class VoronoiMinimap:
 
         # Ball position smoothing
         self._smoothed_ball: Optional[np.ndarray] = None
+
+        # Outlier rejection: max allowed position jump per frame (cm)
+        self._jump_threshold = jump_threshold_cm
+
+        # Pitch bounds for clamping (cm)
+        self._pitch_x_max_cm = float(config.length)
+        self._pitch_y_max_cm = float(config.width)
 
         # Compute scale: map pitch cm → minimap pixels
         usable_w = minimap_width - 2 * padding
@@ -223,8 +231,19 @@ class VoronoiMinimap:
         for i in range(len(jersey_ids)):
             tid = int(jersey_ids[i])
             current_ids.add(tid)
+
+            # Clamp position to pitch boundaries
+            smoothed[i][0] = np.clip(smoothed[i][0], 0, self._pitch_x_max_cm)
+            smoothed[i][1] = np.clip(smoothed[i][1], 0, self._pitch_y_max_cm)
+
             if tid in self._smoothed:
-                smoothed[i] = a * xy_cm[i] + (1.0 - a) * self._smoothed[tid]
+                # Outlier rejection: if position jumps too far, keep old position
+                delta = np.linalg.norm(smoothed[i] - self._smoothed[tid])
+                if delta > self._jump_threshold:
+                    smoothed[i] = self._smoothed[tid]  # reject, keep old
+                else:
+                    smoothed[i] = a * smoothed[i] + (1.0 - a) * self._smoothed[tid]
+
             self._smoothed[tid] = smoothed[i].copy()
             self._smoothed_team[tid] = int(team_ids[i])
             self._ghost_age[tid] = 0  # reset age — player is visible
